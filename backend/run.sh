@@ -18,7 +18,7 @@ else
     source venv/bin/activate
 fi
 
-echo "Starting M5 Audio Platform backend on http://0.0.0.0:8000"
-echo "Web portal: http://localhost:8000/"
+echo "Starting M5 Audio Platform backend on http://0.0.0.0:8888"
+echo "Web portal: http://localhost:8888/"
 echo ""
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 0.0.0.0 --port 8888 --reload
