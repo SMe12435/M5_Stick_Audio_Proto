@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M5 Audio Platform</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #0f1117;
+            --surface: #1a1d27;
+            --surface2: #242736;
+            --border: #2e3144;
+            --text: #e4e6ef;
+            --text-muted: #8b8fa3;
+            --primary: #6c63ff;
+            --primary-hover: #5a52e0;
+            --accent: #00d4aa;
+            --danger: #ff4d6a;
+            --warning: #ffb84d;
+            --radius: 12px;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+
+        /* ── Header ── */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 32px;
+        }
+        header h1 { font-size: 20px; font-weight: 600; }
+        header .user-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+
+        /* ── Auth Form ── */
+        .auth-card {
+            max-width: 400px;
+            margin: 80px auto;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 40px 32px;
+        }
+        .auth-card h2 {
+            font-size: 24px;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+        .auth-card p {
+            color: var(--text-muted);
+            text-align: center;
+            margin-bottom: 24px;
+            font-size: 14px;
+        }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        input[type="text"], input[type="email"], input[type="password"] {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input:focus { border-color: var(--primary); }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+            width: 100%;
+        }
+        .btn-primary:hover { background: var(--primary-hover); }
+        .btn-sm { padding: 8px 16px; font-size: 13px; width: auto; }
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        .btn-outline:hover { border-color: var(--primary); color: var(--primary); }
+        .btn-danger { background: var(--danger); color: white; }
+
+        .auth-toggle {
+            text-align: center;
+            margin-top: 16px;
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+        .auth-toggle a {
+            color: var(--primary);
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .auth-toggle a:hover { text-decoration: underline; }
+
+        .error-msg {
+            background: rgba(255,77,106,0.1);
+            border: 1px solid var(--danger);
+            color: var(--danger);
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 13px;
+            margin-bottom: 16px;
+            display: none;
+        }
+
+        /* ── Dashboard ── */
+        .tabs {
+            display: flex;
+            gap: 4px;
+            background: var(--surface);
+            padding: 4px;
+            border-radius: 10px;
+            margin-bottom: 24px;
+        }
+        .tab {
+            flex: 1;
+            padding: 10px;
+            text-align: center;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            color: var(--text-muted);
+            transition: all 0.2s;
+            border: none;
+            background: transparent;
+        }
+        .tab.active { background: var(--primary); color: white; }
+        .tab:hover:not(.active) { color: var(--text); }
+
+        .panel { display: none; }
+        .panel.active { display: block; }
+
+        /* ── Live Panel ── */
+        .live-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+            background: var(--surface);
+            border-radius: var(--radius);
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+        .status-dot {
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+        .status-dot.connected { background: var(--accent); }
+        .status-dot.streaming { background: var(--danger); animation: pulse 1s infinite; }
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+
+        .live-transcript {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            min-height: 200px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-size: 15px;
+            line-height: 1.7;
+            white-space: pre-wrap;
+        }
+        .live-transcript .placeholder {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .rms-bar-container {
+            height: 6px;
+            background: var(--surface2);
+            border-radius: 3px;
+            margin-top: 12px;
+            overflow: hidden;
+        }
+        .rms-bar {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 3px;
+            width: 0%;
+            transition: width 0.15s;
+        }
+
+        /* ── Pair Panel ── */
+        .pair-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 32px;
+            text-align: center;
+            max-width: 440px;
+            margin: 0 auto;
+        }
+        .pair-card h3 { font-size: 18px; margin-bottom: 8px; }
+        .pair-card p { color: var(--text-muted); font-size: 14px; margin-bottom: 24px; }
+        .pair-input {
+            font-size: 28px !important;
+            text-align: center;
+            letter-spacing: 8px;
+            text-transform: uppercase;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            max-width: 280px;
+            margin: 0 auto 16px;
+        }
+        .pair-success {
+            color: var(--accent);
+            font-size: 14px;
+            margin-top: 12px;
+            display: none;
+        }
+
+        /* ── Sessions Panel ── */
+        .session-list { display: flex; flex-direction: column; gap: 8px; }
+        .session-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px 20px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .session-card:hover { border-color: var(--primary); }
+        .session-card .session-time {
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .session-card .session-meta {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+        .session-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .session-badge.streaming { background: rgba(255,77,106,0.15); color: var(--danger); }
+        .session-badge.processing { background: rgba(255,184,77,0.15); color: var(--warning); }
+        .session-badge.done { background: rgba(0,212,170,0.15); color: var(--accent); }
+
+        /* ── Session Detail ── */
+        .detail-back {
+            font-size: 14px;
+            color: var(--primary);
+            cursor: pointer;
+            margin-bottom: 16px;
+            display: inline-block;
+        }
+        .detail-back:hover { text-decoration: underline; }
+
+        .detail-section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .detail-section h4 {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+        }
+        .detail-section .content {
+            font-size: 15px;
+            line-height: 1.7;
+        }
+        .note-item {
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+        }
+        .note-item:last-child { border-bottom: none; }
+        .note-type {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-right: 8px;
+        }
+        .note-type.summary { background: rgba(108,99,255,0.15); color: var(--primary); }
+        .note-type.action_item { background: rgba(255,77,106,0.15); color: var(--danger); }
+        .note-type.decision { background: rgba(255,184,77,0.15); color: var(--warning); }
+        .note-type.note { background: rgba(0,212,170,0.15); color: var(--accent); }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+        .empty-state p { margin-top: 8px; font-size: 14px; }
+
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+
+<!-- ════════ Auth View ════════ -->
+<div id="auth-view">
+    <div class="auth-card">
+        <h2 id="auth-title">Sign In</h2>
+        <p id="auth-subtitle">Access your audio recordings and notes</p>
+        <div id="auth-error" class="error-msg"></div>
+        <form id="auth-form">
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" id="auth-email" required placeholder="you@example.com">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="auth-password" required placeholder="Enter password">
+            </div>
+            <button type="submit" class="btn btn-primary" id="auth-submit">Sign In</button>
+        </form>
+        <div class="auth-toggle">
+            <span id="auth-toggle-text">Don't have an account?</span>
+            <a id="auth-toggle-link" onclick="toggleAuthMode()">Create one</a>
+        </div>
+    </div>
+</div>
+
+<!-- ════════ Dashboard View ════════ -->
+<div id="dashboard-view" class="hidden">
+    <div class="container">
+        <header>
+            <h1>M5 Audio</h1>
+            <div class="user-info">
+                <span id="user-email"></span>
+                <button class="btn btn-sm btn-outline" onclick="logout()">Sign Out</button>
+            </div>
+        </header>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('live')">Live</button>
+            <button class="tab" onclick="switchTab('pair')">Pair Device</button>
+            <button class="tab" onclick="switchTab('sessions')">Sessions</button>
+        </div>
+
+        <!-- Live Tab -->
+        <div id="panel-live" class="panel active">
+            <div class="live-status">
+                <div class="status-dot" id="ws-status-dot"></div>
+                <span id="ws-status-text">Connecting...</span>
+                <span style="margin-left:auto; font-size:13px; color:var(--text-muted)" id="stream-info"></span>
+            </div>
+            <div class="rms-bar-container">
+                <div class="rms-bar" id="rms-bar"></div>
+            </div>
+            <div class="live-transcript" id="live-transcript">
+                <span class="placeholder">Waiting for audio stream from device...</span>
+            </div>
+        </div>
+
+        <!-- Pair Tab -->
+        <div id="panel-pair" class="panel">
+            <div class="pair-card">
+                <h3>Pair Your Device</h3>
+                <p>Enter the 6-character code shown on your M5StickC screen</p>
+                <input type="text" class="pair-input" id="pair-code-input"
+                       maxlength="6" placeholder="------" autocomplete="off">
+                <br>
+                <button class="btn btn-primary btn-sm" onclick="pairDevice()" id="pair-btn">Pair Device</button>
+                <div class="pair-success" id="pair-success">Device paired successfully!</div>
+                <div id="pair-error" class="error-msg" style="margin-top:12px"></div>
+            </div>
+        </div>
+
+        <!-- Sessions Tab -->
+        <div id="panel-sessions" class="panel">
+            <div id="sessions-list" class="session-list"></div>
+            <div id="sessions-empty" class="empty-state hidden">
+                <p>No recording sessions yet.</p>
+                <p>Press Button A on your M5StickC to start recording.</p>
+            </div>
+        </div>
+
+        <!-- Session Detail (overlay) -->
+        <div id="panel-detail" class="panel">
+            <span class="detail-back" onclick="backToSessions()">&#8592; Back to Sessions</span>
+            <div id="detail-content"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin;
+let authToken = localStorage.getItem('token');
+let isRegisterMode = false;
+let userWs = null;
+let currentTranscript = '';
+
+// ── Auth ──
+function toggleAuthMode() {
+    isRegisterMode = !isRegisterMode;
+    document.getElementById('auth-title').textContent = isRegisterMode ? 'Create Account' : 'Sign In';
+    document.getElementById('auth-subtitle').textContent = isRegisterMode
+        ? 'Start capturing and processing audio' : 'Access your audio recordings and notes';
+    document.getElementById('auth-submit').textContent = isRegisterMode ? 'Create Account' : 'Sign In';
+    document.getElementById('auth-toggle-text').textContent = isRegisterMode
+        ? 'Already have an account?' : "Don't have an account?";
+    document.getElementById('auth-toggle-link').textContent = isRegisterMode ? 'Sign in' : 'Create one';
+    document.getElementById('auth-error').style.display = 'none';
+}
+
+document.getElementById('auth-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = document.getElementById('auth-email').value;
+    const password = document.getElementById('auth-password').value;
+    const endpoint = isRegisterMode ? '/api/auth/register' : '/api/auth/login';
+
+    try {
+        const res = await fetch(API_BASE + endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Auth failed');
+
+        authToken = data.access_token;
+        localStorage.setItem('token', authToken);
+        showDashboard();
+    } catch (err) {
+        const el = document.getElementById('auth-error');
+        el.textContent = err.message;
+        el.style.display = 'block';
+    }
+});
+
+function logout() {
+    authToken = null;
+    localStorage.removeItem('token');
+    if (userWs) userWs.close();
+    document.getElementById('auth-view').classList.remove('hidden');
+    document.getElementById('dashboard-view').classList.add('hidden');
+}
+
+// ── Dashboard Init ──
+async function showDashboard() {
+    try {
+        const res = await fetch(API_BASE + '/api/auth/me', {
+            headers: { 'Authorization': 'Bearer ' + authToken },
+        });
+        if (!res.ok) { logout(); return; }
+        const user = await res.json();
+        document.getElementById('user-email').textContent = user.email;
+    } catch { logout(); return; }
+
+    document.getElementById('auth-view').classList.add('hidden');
+    document.getElementById('dashboard-view').classList.remove('hidden');
+
+    connectUserWs();
+    loadSessions();
+}
+
+// ── Tabs ──
+function switchTab(name) {
+    document.querySelectorAll('.tab').forEach((t, i) => {
+        t.classList.toggle('active', ['live','pair','sessions'][i] === name);
+    });
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    const panel = document.getElementById('panel-' + name);
+    if (panel) panel.classList.add('active');
+    if (name === 'sessions') loadSessions();
+}
+
+// ── User WebSocket ──
+function connectUserWs() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws/user?token=${authToken}`;
+
+    userWs = new WebSocket(wsUrl);
+    const dot = document.getElementById('ws-status-dot');
+    const text = document.getElementById('ws-status-text');
+
+    userWs.onopen = () => {
+        dot.className = 'status-dot connected';
+        text.textContent = 'Connected — waiting for device';
+    };
+
+    userWs.onclose = () => {
+        dot.className = 'status-dot';
+        text.textContent = 'Disconnected';
+        setTimeout(connectUserWs, 3000);
+    };
+
+    userWs.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        handleWsMessage(msg);
+    };
+
+    // Keepalive
+    setInterval(() => {
+        if (userWs && userWs.readyState === WebSocket.OPEN) {
+            userWs.send(JSON.stringify({ type: 'ping' }));
+        }
+    }, 30000);
+}
+
+function handleWsMessage(msg) {
+    const dot = document.getElementById('ws-status-dot');
+    const text = document.getElementById('ws-status-text');
+    const info = document.getElementById('stream-info');
+    const transcript = document.getElementById('live-transcript');
+    const rmsBar = document.getElementById('rms-bar');
+
+    switch (msg.type) {
+        case 'stream_start':
+            dot.className = 'status-dot streaming';
+            text.textContent = 'Recording in progress';
+            info.textContent = '';
+            currentTranscript = '';
+            transcript.innerHTML = '<span class="placeholder">Listening...</span>';
+            rmsBar.style.width = '0%';
+            break;
+
+        case 'stream_progress':
+            info.textContent = `${msg.duration}s — ${msg.chunks} chunks`;
+            rmsBar.style.width = Math.min(100, msg.rms / 100) + '%';
+            break;
+
+        case 'stream_end':
+            dot.className = 'status-dot connected';
+            text.textContent = 'Processing transcript...';
+            info.textContent = `${msg.duration}s recorded`;
+            rmsBar.style.width = '0%';
+            break;
+
+        case 'transcript_final':
+            currentTranscript = msg.text;
+            transcript.innerHTML = '';
+            transcript.textContent = msg.text || '(no speech detected)';
+            text.textContent = 'Extracting notes...';
+            break;
+
+        case 'session_processed':
+            text.textContent = 'Connected — waiting for device';
+            let html = '';
+            if (msg.summary) {
+                html += `<strong>Summary:</strong> ${msg.summary}\n\n`;
+            }
+            if (msg.action_items && msg.action_items.length) {
+                html += `<strong>Action Items:</strong>\n`;
+                msg.action_items.forEach(a => html += `  • ${a}\n`);
+                html += '\n';
+            }
+            if (msg.decisions && msg.decisions.length) {
+                html += `<strong>Decisions:</strong>\n`;
+                msg.decisions.forEach(d => html += `  • ${d}\n`);
+                html += '\n';
+            }
+            if (msg.notes && msg.notes.length) {
+                html += `<strong>Notes:</strong>\n`;
+                msg.notes.forEach(n => html += `  • ${n}\n`);
+            }
+            if (currentTranscript) {
+                html += `\n──────────────\n<strong>Full Transcript:</strong>\n${currentTranscript}`;
+            }
+            transcript.innerHTML = html || transcript.innerHTML;
+            loadSessions();
+            break;
+    }
+}
+
+// ── Pair Device ──
+async function pairDevice() {
+    const code = document.getElementById('pair-code-input').value.trim().toUpperCase();
+    if (code.length !== 6) {
+        showPairError('Please enter the full 6-character code');
+        return;
+    }
+
+    try {
+        const res = await fetch(API_BASE + '/api/devices/pair', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + authToken,
+            },
+            body: JSON.stringify({ code }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Pairing failed');
+
+        document.getElementById('pair-success').style.display = 'block';
+        document.getElementById('pair-error').style.display = 'none';
+        document.getElementById('pair-code-input').value = '';
+    } catch (err) {
+        showPairError(err.message);
+    }
+}
+
+function showPairError(msg) {
+    const el = document.getElementById('pair-error');
+    el.textContent = msg;
+    el.style.display = 'block';
+    document.getElementById('pair-success').style.display = 'none';
+}
+
+// ── Sessions ──
+async function loadSessions() {
+    try {
+        const res = await fetch(API_BASE + '/api/sessions', {
+            headers: { 'Authorization': 'Bearer ' + authToken },
+        });
+        const sessions = await res.json();
+
+        const list = document.getElementById('sessions-list');
+        const empty = document.getElementById('sessions-empty');
+
+        if (sessions.length === 0) {
+            list.innerHTML = '';
+            empty.classList.remove('hidden');
+            return;
+        }
+
+        empty.classList.add('hidden');
+        list.innerHTML = sessions.map(s => `
+            <div class="session-card" onclick="viewSession(${s.id})">
+                <div class="session-time">
+                    ${new Date(s.started_at).toLocaleString()}
+                    <span class="session-badge ${s.status}">${s.status}</span>
+                </div>
+                <div class="session-meta">
+                    ${s.ended_at ? 'Duration: ' + formatDuration(s.started_at, s.ended_at) : 'In progress...'}
+                </div>
+            </div>
+        `).join('');
+    } catch (err) {
+        console.error('Failed to load sessions:', err);
+    }
+}
+
+function formatDuration(start, end) {
+    const ms = new Date(end) - new Date(start);
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
+
+async function viewSession(id) {
+    try {
+        const res = await fetch(API_BASE + '/api/sessions/' + id, {
+            headers: { 'Authorization': 'Bearer ' + authToken },
+        });
+        const data = await res.json();
+
+        let html = '';
+
+        if (data.transcript) {
+            html += `<div class="detail-section">
+                <h4>Transcript</h4>
+                <div class="content">${data.transcript}</div>
+            </div>`;
+        }
+
+        if (data.notes && data.notes.length) {
+            html += `<div class="detail-section"><h4>Notes & Actions</h4>`;
+            data.notes.forEach(n => {
+                html += `<div class="note-item">
+                    <span class="note-type ${n.type}">${n.type.replace('_', ' ')}</span>
+                    ${n.content}
+                </div>`;
+            });
+            html += `</div>`;
+        }
+
+        if (!data.transcript && (!data.notes || !data.notes.length)) {
+            html = `<div class="empty-state"><p>No transcript or notes yet.</p>
+                <p>This session may still be processing.</p></div>`;
+        }
+
+        document.getElementById('detail-content').innerHTML = html;
+
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        document.getElementById('panel-detail').classList.add('active');
+    } catch (err) {
+        console.error('Failed to load session:', err);
+    }
+}
+
+function backToSessions() {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.getElementById('panel-sessions').classList.add('active');
+    document.querySelectorAll('.tab').forEach((t, i) => {
+        t.classList.toggle('active', i === 2);
+    });
+    loadSessions();
+}
+
+// ── Init ──
+if (authToken) {
+    showDashboard();
+}
+</script>
+</body>
+</html>
