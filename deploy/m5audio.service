@@ -1,0 +1,15 @@
+[Unit]
+Description=M5 Audio Platform Backend
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/M5_Stick_Audio_Proto/backend
+EnvironmentFile=/home/ubuntu/M5_Stick_Audio_Proto/backend/.env
+ExecStart=/home/ubuntu/M5_Stick_Audio_Proto/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8888
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
