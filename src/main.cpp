@@ -146,6 +146,54 @@ static int    otaFileSize = 0;
 static unsigned long lastOtaCheck = 0;
 static constexpr unsigned long OTA_CHECK_INTERVAL = 3600000; // 1 hour
 
+// ── Canvas Art (Pixel Doodle) ──────────────────────────
+static constexpr int CANVAS_W = 48;
+static constexpr int CANVAS_H = 27;
+static constexpr int CANVAS_PIXELS = CANVAS_W * CANVAS_H;
+static constexpr int CANVAS_BYTES  = CANVAS_PIXELS * 2; // RGB565
+static uint16_t canvasPixels[CANVAS_PIXELS];
+static bool hasCanvasArt   = false;
+static bool showingCanvas  = false;
+
+static const uint8_t B64_LUT[128] = {
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+    52,53,54,55,56,57,58,59,60,61,64,64,64, 0,64,64,
+    64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+    64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64
+};
+
+static int base64Decode(const char* src, int srcLen, uint8_t* dst, int dstCap) {
+    int out = 0;
+    uint32_t buf = 0;
+    int bits = 0;
+    for (int i = 0; i < srcLen && out < dstCap; i++) {
+        char c = src[i];
+        if (c == '=' || c < 0 || c > 127) continue;
+        uint8_t v = B64_LUT[(int)c];
+        if (v > 63) continue;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            dst[out++] = (buf >> bits) & 0xFF;
+        }
+    }
+    return out;
+}
+
+static void renderCanvasToDisplay() {
+    for (int y = 0; y < CANVAS_H; y++) {
+        for (int x = 0; x < CANVAS_W; x++) {
+            uint16_t color = canvasPixels[y * CANVAS_W + x];
+            M5.Display.fillRect(x * 5, y * 5, 5, 5, color);
+        }
+    }
+}
+
 // ── Captive Portal Globals ──────────────────────────────
 static WebServer*  portalServer = nullptr;
 static DNSServer*  portalDns    = nullptr;
@@ -316,6 +364,32 @@ static void onWsMessage(WebsocketsMessage msg) {
             showCentered("PAIRED!", GREEN);
             delay(1500);
             appState = STATE_WS_CONNECTING;
+        }
+    } else if (data.indexOf("\"display_update\"") >= 0) {
+        int pxStart = data.indexOf("\"pixels\":\"") + 10;
+        int pxEnd = data.indexOf("\"", pxStart);
+        if (pxStart > 9 && pxEnd > pxStart) {
+            String b64 = data.substring(pxStart, pxEnd);
+            uint8_t rawBuf[CANVAS_BYTES];
+            int decoded = base64Decode(b64.c_str(), b64.length(), rawBuf, CANVAS_BYTES);
+            if (decoded >= CANVAS_BYTES) {
+                memcpy(canvasPixels, rawBuf, CANVAS_BYTES);
+                hasCanvasArt = true;
+                Serial.println("Canvas art received and decoded");
+
+                prefs.begin("audio", false);
+                prefs.putBytes("canvas", canvasPixels, CANVAS_BYTES);
+                prefs.putBool("hasCanvas", true);
+                prefs.end();
+
+                if (appState == STATE_READY && showingCanvas) {
+                    M5.Display.fillScreen(BLACK);
+                    renderCanvasToDisplay();
+                    screenWake();
+                }
+            } else {
+                Serial.printf("Canvas decode failed: got %d, expected %d\n", decoded, CANVAS_BYTES);
+            }
         }
     }
 }
@@ -936,7 +1010,13 @@ void setup() {
     cfgPassword   = prefs.getString("pass", "");
     cfgServerUrl  = prefs.getString("server", DEFAULT_SERVER);
     deviceToken   = prefs.getString("token", "");
+    hasCanvasArt  = prefs.getBool("hasCanvas", false);
+    if (hasCanvasArt) {
+        size_t read = prefs.getBytes("canvas", canvasPixels, (size_t)CANVAS_BYTES);
+        if (read != (size_t)CANVAS_BYTES) hasCanvasArt = false;
+    }
     prefs.end();
+    if (hasCanvasArt) Serial.println("Canvas art loaded from storage");
 
     Serial.printf("Config: ssid='%s', server='%s', token=%s\n",
         cfgSsid.c_str(), cfgServerUrl.c_str(),
@@ -1102,7 +1182,7 @@ void loop() {
         showCentered("CLOUD..", YELLOW);
         if (connectWebSocket()) {
             appState = STATE_READY;
-            showCentered("READY", CYAN);
+            showCentered("READY", ORANGE);
             drawBattery();
             screenWake();
             Serial.printf("Connected to cloud. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
@@ -1143,7 +1223,7 @@ void loop() {
                     appState = STATE_OTA_UPDATING;
                     break;
                 }
-                showCentered("READY", CYAN);
+                showCentered("READY", ORANGE);
                 drawBattery();
             }
         }
@@ -1155,9 +1235,14 @@ void loop() {
         if (M5.BtnA.wasPressed()) {
             if (!screenOn) {
                 screenWake();
-                showCentered("READY", CYAN);
-                drawBattery();
+                if (showingCanvas && hasCanvasArt) {
+                    renderCanvasToDisplay();
+                } else {
+                    showCentered("READY", ORANGE);
+                    drawBattery();
+                }
             } else {
+                showingCanvas = false;
                 Serial.println("Starting stream...");
 
                 adpcmState.predictor = 0;
@@ -1181,6 +1266,19 @@ void loop() {
                 drawBattery();
                 screenWake();
                 Serial.printf("Stream started. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
+            }
+        }
+
+        if (M5.BtnB.wasPressed()) {
+            screenWake();
+            if (showingCanvas) {
+                showingCanvas = false;
+                showCentered("READY", ORANGE);
+                drawBattery();
+            } else if (hasCanvasArt) {
+                showingCanvas = true;
+                M5.Display.fillScreen(BLACK);
+                renderCanvasToDisplay();
             }
         }
         break;
@@ -1218,7 +1316,7 @@ void loop() {
 
             appState = STATE_READY;
             screenWake();
-            showCentered("READY", CYAN);
+            showCentered("READY", ORANGE);
             drawBattery();
             break;
         }

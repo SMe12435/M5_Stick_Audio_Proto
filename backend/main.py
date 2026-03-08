@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packaging.version import Version
 
 from database import init_db, get_db, async_session
-from models import User, Device, Session, SessionStatus, Transcription, Note, NoteType, FirmwareVersion
+from models import User, Device, Session, SessionStatus, Transcription, Note, NoteType, FirmwareVersion, CanvasArt
 from auth import hash_password, verify_password, create_access_token, get_current_user
 from adpcm import AdpcmDecoder
 from config import ELEVENLABS_API_KEY, OPENAI_API_KEY, PAIRING_CODE_EXPIRY_SECONDS
@@ -429,6 +429,107 @@ async def get_session(session_id: int, user: User = Depends(get_current_user), d
 
 
 # ═══════════════════════════════════════════════════════════════
+# REST API: Canvas Art (Pixel Doodle Studio)
+# ═══════════════════════════════════════════════════════════════
+
+CANVAS_WIDTH = 48
+CANVAS_HEIGHT = 27
+CANVAS_PIXELS = CANVAS_WIDTH * CANVAS_HEIGHT  # 1296
+
+
+class CanvasSaveRequest(BaseModel):
+    name: str
+    pixel_data: str
+
+
+class CanvasSendRequest(BaseModel):
+    pixel_data: str
+
+
+@app.post("/api/canvas", status_code=201)
+async def save_canvas(
+    req: CanvasSaveRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    count_result = await db.execute(
+        select(CanvasArt).where(CanvasArt.user_id == user.id)
+    )
+    if len(count_result.scalars().all()) >= 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 saved canvases reached")
+
+    art = CanvasArt(user_id=user.id, name=req.name, pixel_data=req.pixel_data)
+    db.add(art)
+    await db.commit()
+    await db.refresh(art)
+    return {"id": art.id, "name": art.name, "created_at": str(art.created_at)}
+
+
+@app.get("/api/canvas")
+async def list_canvas(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(CanvasArt)
+        .where(CanvasArt.user_id == user.id)
+        .order_by(CanvasArt.created_at.desc())
+    )
+    arts = result.scalars().all()
+    return [
+        {"id": a.id, "name": a.name, "pixel_data": a.pixel_data, "created_at": str(a.created_at)}
+        for a in arts
+    ]
+
+
+@app.delete("/api/canvas/{canvas_id}")
+async def delete_canvas(
+    canvas_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(CanvasArt).where(CanvasArt.id == canvas_id, CanvasArt.user_id == user.id)
+    )
+    art = result.scalar_one_or_none()
+    if not art:
+        raise HTTPException(status_code=404, detail="Canvas not found")
+    await db.delete(art)
+    await db.commit()
+    return {"status": "deleted"}
+
+
+@app.post("/api/canvas/send/{device_id}")
+async def send_canvas_to_device(
+    device_id: int,
+    req: CanvasSendRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Push pixel art to a connected device."""
+    result = await db.execute(
+        select(Device).where(Device.id == device_id, Device.user_id == user.id)
+    )
+    device = result.scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    ws = device_connections.get(device_id)
+    if not ws:
+        raise HTTPException(status_code=409, detail="Device is offline")
+
+    try:
+        await ws.send_json({
+            "type": "display_update",
+            "width": CANVAS_WIDTH,
+            "height": CANVAS_HEIGHT,
+            "pixels": req.pixel_data,
+        })
+    except Exception:
+        device_connections.pop(device_id, None)
+        raise HTTPException(status_code=409, detail="Device connection lost")
+
+    return {"status": "sent", "device_id": device_id}
+
+
+# ═══════════════════════════════════════════════════════════════
 # WebSocket: Device Audio Stream
 # ═══════════════════════════════════════════════════════════════
 
@@ -820,11 +921,34 @@ async def ws_user(websocket: WebSocket):
 
     try:
         while True:
-            # Keep connection alive, handle any client messages
             data = await websocket.receive_text()
             msg = json.loads(data)
             if msg.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
+            elif msg.get("type") == "display_update":
+                device_id = msg.get("device_id")
+                dev_ws = device_connections.get(device_id)
+                if dev_ws:
+                    async with async_session() as db:
+                        result = await db.execute(
+                            select(Device).where(Device.id == device_id, Device.user_id == user_id)
+                        )
+                        if result.scalar_one_or_none():
+                            try:
+                                await dev_ws.send_json({
+                                    "type": "display_update",
+                                    "width": msg.get("width", CANVAS_WIDTH),
+                                    "height": msg.get("height", CANVAS_HEIGHT),
+                                    "pixels": msg.get("pixels", ""),
+                                })
+                                await websocket.send_json({"type": "display_sent"})
+                            except Exception:
+                                device_connections.pop(device_id, None)
+                                await websocket.send_json({"type": "display_error", "message": "Device connection lost"})
+                        else:
+                            await websocket.send_json({"type": "display_error", "message": "Device not found"})
+                else:
+                    await websocket.send_json({"type": "display_error", "message": "Device is offline"})
     except WebSocketDisconnect:
         user_connections[user_id].remove(websocket)
         if not user_connections[user_id]:

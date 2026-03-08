@@ -104,3 +104,15 @@ class FirmwareVersion(Base):
     release_notes = Column(Text, nullable=True)
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CanvasArt(Base):
+    __tablename__ = "canvas_art"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    name = Column(String(100), nullable=False)
+    pixel_data = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
