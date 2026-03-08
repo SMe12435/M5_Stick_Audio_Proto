@@ -119,6 +119,15 @@ static constexpr unsigned long WS_RECONNECT_INTERVAL = 5000;
 static unsigned long lastPairingPoll = 0;
 static constexpr unsigned long PAIRING_POLL_INTERVAL = 3000;
 
+// ── Screen Power Management ────────────────────────────
+static bool screenOn = true;
+static unsigned long screenOnMs = 0;
+static constexpr unsigned long SCREEN_TIMEOUT = 5000;
+
+// ── WebSocket Keepalive ────────────────────────────────
+static unsigned long lastWsPing = 0;
+static constexpr unsigned long WS_PING_INTERVAL = 15000;
+
 // ── Captive Portal Globals ──────────────────────────────
 static WebServer*  portalServer = nullptr;
 static DNSServer*  portalDns    = nullptr;
@@ -201,6 +210,29 @@ static void showSetupScreen() {
     M5.Display.printf("Open http://%s", WiFi.softAPIP().toString().c_str());
 }
 
+// ── Screen Power Helpers ────────────────────────────────
+static void screenWake() {
+    M5.Display.setBrightness(80);
+    screenOn = true;
+    screenOnMs = millis();
+}
+
+static void screenSleep() {
+    M5.Display.setBrightness(0);
+    screenOn = false;
+}
+
+static void drawBattery() {
+    int pct = M5.Power.getBatteryLevel();
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(pct > 20 ? GREEN : RED, BLACK);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", pct);
+    int16_t x = M5.Display.width() - M5.Display.textWidth(buf) - 4;
+    M5.Display.setCursor(x, 2);
+    M5.Display.print(buf);
+}
+
 // ── DC Offset Removal ───────────────────────────────────
 static void removeDcInPlace(int16_t* buf, size_t len) {
     for (size_t i = 0; i < len; i++) {
@@ -242,15 +274,9 @@ static void onWsEvent(WebsocketsEvent event, String data) {
         wsConnected = true;
         break;
     case WebsocketsEvent::ConnectionClosed:
-        Serial.println("WS: disconnected");
+        Serial.printf("WS: disconnected (state=%d, heap=%u, RSSI=%d)\n",
+            (int)appState, (unsigned)ESP.getFreeHeap(), WiFi.RSSI());
         wsConnected = false;
-        if (appState == STATE_STREAMING) {
-            M5.Mic.end();
-            appState = STATE_WS_CONNECTING;
-            Serial.println("Streaming aborted: WS disconnected");
-        } else if (appState == STATE_READY) {
-            appState = STATE_WS_CONNECTING;
-        }
         break;
     case WebsocketsEvent::GotPing:
         break;
@@ -620,6 +646,7 @@ void loop() {
             pairingCode = generatePairingCode();
             Serial.printf("Pairing code: %s\n", pairingCode.c_str());
             showTwoLines("PAIR CODE:", pairingCode.c_str(), CYAN);
+            drawBattery();
 
             if (registerForPairing()) {
                 Serial.println("Registered with cloud, waiting for user to pair...");
@@ -663,6 +690,8 @@ void loop() {
         if (connectWebSocket()) {
             appState = STATE_READY;
             showCentered("READY", GREEN);
+            drawBattery();
+            screenWake();
             Serial.printf("Connected to cloud. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
         } else {
             Serial.println("WS: connection failed, retrying...");
@@ -678,27 +707,40 @@ void loop() {
             break;
         }
 
+        if (screenOn && millis() - screenOnMs >= SCREEN_TIMEOUT) {
+            screenSleep();
+        }
+
         if (M5.BtnA.wasPressed()) {
-            Serial.println("Starting stream...");
+            if (!screenOn) {
+                screenWake();
+                showCentered("READY", GREEN);
+                drawBattery();
+            } else {
+                Serial.println("Starting stream...");
 
-            adpcmState.predictor = 0;
-            adpcmState.index = 0;
-            dcOffset = 0;
+                adpcmState.predictor = 0;
+                adpcmState.index = 0;
+                dcOffset = 0;
 
-            M5.Mic.begin();
-            delay(80);
+                M5.Mic.begin();
+                delay(80);
 
-            uint8_t hdr[8];
-            uint32_t sr = SAMPLE_RATE;
-            uint32_t marker = 1;
-            memcpy(hdr, &sr, 4);
-            memcpy(hdr + 4, &marker, 4);
-            wsClient.sendBinary((const char*)hdr, sizeof(hdr));
+                uint8_t hdr[8];
+                uint32_t sr = SAMPLE_RATE;
+                uint32_t marker = 1;
+                memcpy(hdr, &sr, 4);
+                memcpy(hdr + 4, &marker, 4);
+                wsClient.sendBinary((const char*)hdr, sizeof(hdr));
 
-            streamStartMs = millis();
-            appState = STATE_STREAMING;
-            showStreaming(0, nullptr, 0);
-            Serial.printf("Stream started. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
+                streamStartMs = millis();
+                lastWsPing = millis();
+                appState = STATE_STREAMING;
+                showStreaming(0, nullptr, 0);
+                drawBattery();
+                screenWake();
+                Serial.printf("Stream started. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
+            }
         }
         break;
     }
@@ -706,9 +748,18 @@ void loop() {
     case STATE_STREAMING: {
         wsClient.poll();
 
+        if (wsConnected && millis() - lastWsPing >= WS_PING_INTERVAL) {
+            wsClient.ping();
+            lastWsPing = millis();
+        }
+
         if (!wsConnected) {
             M5.Mic.end();
+            unsigned long elapsed = (millis() - streamStartMs) / 1000;
+            Serial.printf("Stream lost after %lus (RSSI=%d, heap=%u)\n",
+                elapsed, WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
             appState = STATE_WS_CONNECTING;
+            screenWake();
             showCentered("LOST", RED);
             delay(1000);
             break;
@@ -725,7 +776,9 @@ void loop() {
             Serial.printf("Stream stopped after %lus\n", elapsed);
 
             appState = STATE_READY;
+            screenWake();
             showCentered("READY", GREEN);
+            drawBattery();
             break;
         }
 
@@ -738,11 +791,18 @@ void loop() {
             }
         }
 
-        static int lastDispSec = -1;
-        int sec = (millis() - streamStartMs) / 1000;
-        if (sec != lastDispSec) {
-            showStreaming(sec, pcmChunk, MIC_CHUNK);
-            lastDispSec = sec;
+        if (screenOn && millis() - screenOnMs >= SCREEN_TIMEOUT) {
+            screenSleep();
+        }
+
+        if (screenOn) {
+            static int lastDispSec = -1;
+            int sec = (millis() - streamStartMs) / 1000;
+            if (sec != lastDispSec) {
+                showStreaming(sec, pcmChunk, MIC_CHUNK);
+                drawBattery();
+                lastDispSec = sec;
+            }
         }
 
         break;
