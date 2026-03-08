@@ -6,6 +6,10 @@
 #include <Preferences.h>
 #include <esp_wifi.h>
 #include <esp_system.h>
+#include <esp_ota_ops.h>
+#include <esp_http_client.h>
+#include <esp_partition.h>
+#include "version.h"
 
 using namespace websockets;
 
@@ -87,11 +91,13 @@ static void adpcm_encode_block(const int16_t* pcm, uint8_t* out, size_t numSampl
 enum AppState {
     STATE_SETUP,
     STATE_WIFI_CONNECTING,
+    STATE_OTA_CHECK,
     STATE_CHECK_PAIRED,
     STATE_PAIRING,
     STATE_WS_CONNECTING,
     STATE_READY,
-    STATE_STREAMING
+    STATE_STREAMING,
+    STATE_OTA_UPDATING
 };
 static volatile AppState appState = STATE_SETUP;
 
@@ -119,6 +125,10 @@ static constexpr unsigned long WS_RECONNECT_INTERVAL = 5000;
 static unsigned long lastPairingPoll = 0;
 static constexpr unsigned long PAIRING_POLL_INTERVAL = 3000;
 
+// ── WiFi Retry / Auto-Fallback ─────────────────────────
+static int wifiRetryCount = 0;
+static constexpr int MAX_WIFI_RETRIES = 3;
+
 // ── Screen Power Management ────────────────────────────
 static bool screenOn = true;
 static unsigned long screenOnMs = 0;
@@ -127,6 +137,14 @@ static constexpr unsigned long SCREEN_TIMEOUT = 5000;
 // ── WebSocket Keepalive ────────────────────────────────
 static unsigned long lastWsPing = 0;
 static constexpr unsigned long WS_PING_INTERVAL = 15000;
+
+// ── OTA Update Globals ─────────────────────────────────
+static String otaFirmwareUrl;
+static String otaSha256;
+static String otaVersion;
+static int    otaFileSize = 0;
+static unsigned long lastOtaCheck = 0;
+static constexpr unsigned long OTA_CHECK_INTERVAL = 3600000; // 1 hour
 
 // ── Captive Portal Globals ──────────────────────────────
 static WebServer*  portalServer = nullptr;
@@ -218,7 +236,7 @@ static void screenWake() {
 }
 
 static void screenSleep() {
-    M5.Display.setBrightness(0);
+    M5.Display.setBrightness(10);
     screenOn = false;
 }
 
@@ -263,17 +281,27 @@ static void onWsMessage(WebsocketsMessage msg) {
             String newSsid = data.substring(ssidStart, ssidEnd);
             String newPass = data.substring(passStart, passEnd);
 
-            Serial.printf("WiFi update received: ssid='%s'\n", newSsid.c_str());
+            Serial.printf("WiFi update received: ssid='%s' pass='%s'\n", newSsid.c_str(), newPass.c_str());
 
             prefs.begin("audio", false);
             prefs.putString("ssid", newSsid);
             prefs.putString("pass", newPass);
             prefs.end();
 
-            showCentered("WiFi OK!", GREEN);
-            delay(1500);
-            showCentered("Reboot..", YELLOW);
-            delay(500);
+            M5.Display.fillScreen(BLACK);
+            M5.Display.setTextSize(1);
+            M5.Display.setTextColor(GREEN, BLACK);
+            M5.Display.setCursor(5, 5);
+            M5.Display.print("WiFi Updated!");
+            M5.Display.setTextColor(CYAN, BLACK);
+            M5.Display.setCursor(5, 22);
+            M5.Display.printf("SSID: %s", newSsid.c_str());
+            M5.Display.setCursor(5, 39);
+            M5.Display.printf("PASS: %s", newPass.c_str());
+            M5.Display.setTextColor(YELLOW, BLACK);
+            M5.Display.setCursor(5, 60);
+            M5.Display.print("Rebooting...");
+            delay(4000);
             ESP.restart();
         }
     } else if (data.indexOf("\"paired\"") >= 0) {
@@ -308,6 +336,24 @@ static void onWsEvent(WebsocketsEvent event, String data) {
     case WebsocketsEvent::GotPong:
         break;
     }
+}
+
+// ── HTML Escape Helper ──────────────────────────────────
+static String htmlEscape(const String& s) {
+    String out;
+    out.reserve(s.length() + 8);
+    for (unsigned int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        switch (c) {
+            case '&':  out += "&amp;";  break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&#39;";  break;
+            default:   out += c;        break;
+        }
+    }
+    return out;
 }
 
 // ── Captive Portal ──────────────────────────────────────
@@ -381,7 +427,7 @@ static void handlePortalSave() {
     String pass = portalServer->arg("password");
     String server = portalServer->arg("server");
 
-    Serial.printf("Portal save: ssid=%s, server=%s\n", ssid.c_str(), server.c_str());
+    Serial.printf("Portal save: ssid='%s', pass='%s', server=%s\n", ssid.c_str(), pass.c_str(), server.c_str());
 
     prefs.begin("audio", false);
     prefs.putString("ssid", ssid);
@@ -390,6 +436,20 @@ static void handlePortalSave() {
         prefs.putString("server", server);
     }
     prefs.end();
+
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(GREEN, BLACK);
+    M5.Display.setCursor(5, 5);
+    M5.Display.print("WiFi Saved!");
+    M5.Display.setTextColor(CYAN, BLACK);
+    M5.Display.setCursor(5, 22);
+    M5.Display.printf("SSID: %s", ssid.c_str());
+    M5.Display.setCursor(5, 39);
+    M5.Display.printf("PASS: %s", pass.c_str());
+    M5.Display.setTextColor(YELLOW, BLACK);
+    M5.Display.setCursor(5, 60);
+    M5.Display.print("Rebooting...");
 
     portalServer->send(200, "text/html",
         "<!DOCTYPE html><html><head>"
@@ -418,8 +478,9 @@ static void startCaptivePortal() {
         String ssid = WiFi.SSID(i);
         int rssi = WiFi.RSSI(i);
         if (ssid.length() == 0) continue;
-        netItems += "<div class='net' data-ssid='" + ssid + "'>"
-                  + ssid + "<span class='rssi'>" + String(rssi) + "dB</span></div>";
+        String escaped = htmlEscape(ssid);
+        netItems += "<div class=\"net\" data-ssid=\"" + escaped + "\">"
+                  + escaped + "<span class=\"rssi\">" + String(rssi) + "dB</span></div>";
     }
     WiFi.scanDelete();
     if (n == 0) {
@@ -450,7 +511,17 @@ static void startCaptivePortal() {
 // ── WiFi Connection ─────────────────────────────────────
 static bool connectWiFi() {
     Serial.printf("WiFi: connecting to %s...\n", cfgSsid.c_str());
-    showCentered("WiFi...", YELLOW);
+
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(YELLOW, BLACK);
+    M5.Display.setCursor(5, 5);
+    M5.Display.print("Connecting WiFi...");
+    M5.Display.setTextColor(CYAN, BLACK);
+    M5.Display.setCursor(5, 22);
+    M5.Display.printf("SSID: %s", cfgSsid.c_str());
+    M5.Display.setCursor(5, 39);
+    M5.Display.printf("PASS: %s", cfgPassword.c_str());
 
     WiFi.mode(WIFI_STA);
     delay(500);
@@ -460,8 +531,8 @@ static bool connectWiFi() {
     wifi_config_t wifi_cfg = {};
     strncpy((char*)wifi_cfg.sta.ssid, cfgSsid.c_str(), sizeof(wifi_cfg.sta.ssid));
     strncpy((char*)wifi_cfg.sta.password, cfgPassword.c_str(), sizeof(wifi_cfg.sta.password));
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
-    wifi_cfg.sta.pmf_cfg.capable = false;
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    wifi_cfg.sta.pmf_cfg.capable = true;
     wifi_cfg.sta.pmf_cfg.required = false;
 
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
@@ -480,15 +551,25 @@ static bool connectWiFi() {
         deviceMac = WiFi.macAddress();
         deviceMac.replace(":", "");
         Serial.printf("Device MAC: %s\n", deviceMac.c_str());
+
+        M5.Display.setTextColor(GREEN, BLACK);
+        M5.Display.setCursor(5, 60);
+        M5.Display.printf("OK! IP: %s", WiFi.localIP().toString().c_str());
+        delay(2000);
         return true;
     }
     Serial.println("WiFi: connection failed");
+
+    M5.Display.setTextColor(RED, BLACK);
+    M5.Display.setCursor(5, 60);
+    M5.Display.print("FAILED to connect!");
+    delay(2000);
     return false;
 }
 
 // ── WebSocket Connection ────────────────────────────────
 static bool connectWebSocket() {
-    String url = cfgServerUrl + "?token=" + deviceToken + "&mac=" + deviceMac;
+    String url = cfgServerUrl + "?token=" + deviceToken + "&mac=" + deviceMac + "&fw=" + FW_VERSION;
     Serial.printf("WS: connecting to %s\n", url.c_str());
     return wsClient.connect(url);
 }
@@ -566,6 +647,226 @@ static String pollPairingStatus() {
     return "";
 }
 
+// ── OTA Display Helper ──────────────────────────────────
+static void showOtaProgress(int percent, const char* version) {
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(CYAN, BLACK);
+    M5.Display.setCursor(20, 10);
+    M5.Display.printf("OTA %s", version);
+
+    int totalW = M5.Display.width() - 20;
+    int barW = totalW * percent / 100;
+    M5.Display.fillRect(10, 45, barW, 16, CYAN);
+    M5.Display.fillRect(10 + barW, 45, totalW - barW, 16, DARKGREY);
+    M5.Display.setTextColor(WHITE, BLACK);
+    M5.Display.setCursor(55, 70);
+    M5.Display.printf("%d%%", percent);
+}
+
+// ── OTA Check ───────────────────────────────────────────
+static bool checkForOtaUpdate() {
+    WiFiClient http;
+    String serverHost;
+    int serverPort;
+    parseServerUrl(serverHost, serverPort);
+
+    if (!http.connect(serverHost.c_str(), serverPort)) {
+        Serial.println("OTA check: connection failed");
+        return false;
+    }
+
+    String path = "/api/ota/check?mac=" + deviceMac
+                + "&version=" + String(FW_VERSION)
+                + "&token=" + deviceToken;
+    http.printf("GET %s HTTP/1.1\r\n"
+                "Host: %s:%d\r\n"
+                "Connection: close\r\n\r\n",
+                path.c_str(), serverHost.c_str(), serverPort);
+
+    unsigned long start = millis();
+    while (!http.available() && millis() - start < 5000) delay(10);
+
+    String response = "";
+    while (http.available()) response += (char)http.read();
+    http.stop();
+
+    Serial.printf("OTA check response: %s\n", response.c_str());
+
+    if (response.indexOf("\"update\":true") < 0) return false;
+
+    // Extract firmware_id
+    int fidStart = response.indexOf("\"firmware_id\":") + 14;
+    int fidEnd = response.indexOf(",", fidStart);
+    if (fidEnd < 0) fidEnd = response.indexOf("}", fidStart);
+    String fidStr = response.substring(fidStart, fidEnd);
+    fidStr.trim();
+
+    // Extract version
+    int verStart = response.indexOf("\"version\":\"") + 11;
+    int verEnd = response.indexOf("\"", verStart);
+    otaVersion = response.substring(verStart, verEnd);
+
+    // Extract sha256
+    int shaStart = response.indexOf("\"sha256\":\"") + 10;
+    int shaEnd = response.indexOf("\"", shaStart);
+    otaSha256 = response.substring(shaStart, shaEnd);
+
+    // Extract size
+    int szStart = response.indexOf("\"size\":") + 7;
+    int szEnd = response.indexOf("}", szStart);
+    String szStr = response.substring(szStart, szEnd);
+    szStr.trim();
+    otaFileSize = szStr.toInt();
+
+    // Build download URL
+    otaFirmwareUrl = "/api/ota/firmware/" + fidStr + "?token=" + deviceToken + "&mac=" + deviceMac;
+
+    Serial.printf("OTA available: v%s, %d bytes, sha256=%s\n",
+        otaVersion.c_str(), otaFileSize, otaSha256.substring(0, 16).c_str());
+    return true;
+}
+
+// ── OTA Perform Update ──────────────────────────────────
+static bool performOtaUpdate() {
+    int batt = M5.Power.getBatteryLevel();
+    if (batt > 0 && batt < 30) {
+        showCentered("LOW BAT", RED);
+        Serial.println("OTA aborted: battery too low");
+        delay(2000);
+        return false;
+    }
+    if (WiFi.RSSI() < -80) {
+        showCentered("WEAK WiFi", RED);
+        Serial.println("OTA aborted: weak WiFi signal");
+        delay(2000);
+        return false;
+    }
+    if (ESP.getFreeHeap() < 50000) {
+        showCentered("LOW MEM", RED);
+        Serial.println("OTA aborted: insufficient heap");
+        delay(2000);
+        return false;
+    }
+
+    String serverHost;
+    int serverPort;
+    parseServerUrl(serverHost, serverPort);
+    String fullUrl = "http://" + serverHost + ":" + String(serverPort) + otaFirmwareUrl;
+    Serial.printf("OTA download: %s\n", fullUrl.c_str());
+
+    showOtaProgress(0, otaVersion.c_str());
+
+    esp_http_client_config_t config = {};
+    config.url = fullUrl.c_str();
+    config.timeout_ms = 60000;
+    config.buffer_size = 4096;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        showCentered("OTA ERR", RED);
+        delay(2000);
+        return false;
+    }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        Serial.printf("OTA HTTP open failed: %s\n", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        showCentered("OTA ERR", RED);
+        delay(2000);
+        return false;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length <= 0) {
+        Serial.printf("OTA bad content length: %d\n", content_length);
+        esp_http_client_cleanup(client);
+        showCentered("OTA ERR", RED);
+        delay(2000);
+        return false;
+    }
+
+    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
+    if (!update_partition) {
+        Serial.println("OTA: no update partition found");
+        esp_http_client_cleanup(client);
+        showCentered("OTA ERR", RED);
+        delay(2000);
+        return false;
+    }
+
+    esp_ota_handle_t ota_handle;
+    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        Serial.printf("OTA begin failed: %s\n", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        showCentered("OTA ERR", RED);
+        delay(2000);
+        return false;
+    }
+
+    uint8_t buf[4096];
+    int total_read = 0;
+    int last_percent = -1;
+
+    while (true) {
+        int read_len = esp_http_client_read(client, (char*)buf, sizeof(buf));
+        if (read_len < 0) {
+            Serial.println("OTA read error");
+            esp_ota_abort(ota_handle);
+            esp_http_client_cleanup(client);
+            showCentered("OTA FAIL", RED);
+            delay(3000);
+            return false;
+        }
+        if (read_len == 0) break;
+
+        err = esp_ota_write(ota_handle, buf, read_len);
+        if (err != ESP_OK) {
+            Serial.printf("OTA write failed: %s\n", esp_err_to_name(err));
+            esp_ota_abort(ota_handle);
+            esp_http_client_cleanup(client);
+            showCentered("OTA FAIL", RED);
+            delay(3000);
+            return false;
+        }
+
+        total_read += read_len;
+        int percent = (int)((int64_t)total_read * 100 / content_length);
+        if (percent != last_percent) {
+            showOtaProgress(percent, otaVersion.c_str());
+            last_percent = percent;
+            Serial.printf("OTA progress: %d%%\r", percent);
+        }
+    }
+
+    esp_http_client_cleanup(client);
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        Serial.printf("OTA end failed: %s\n", esp_err_to_name(err));
+        showCentered("OTA FAIL", RED);
+        delay(3000);
+        return false;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        Serial.printf("OTA set boot partition failed: %s\n", esp_err_to_name(err));
+        showCentered("OTA FAIL", RED);
+        delay(3000);
+        return false;
+    }
+
+    Serial.printf("OTA success! %d bytes written. Rebooting into v%s...\n",
+        total_read, otaVersion.c_str());
+    showCentered("REBOOT", GREEN);
+    delay(1500);
+    ESP.restart();
+    return true; // unreachable
+}
+
 // ── Setup ───────────────────────────────────────────────
 void setup() {
     auto cfg = M5.config();
@@ -578,6 +879,17 @@ void setup() {
     showCentered("INIT...", YELLOW);
 
     M5.Speaker.end();
+
+    // OTA rollback safety: validate new firmware after OTA update
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            Serial.println("OTA: New firmware booted, marking as valid");
+            esp_ota_mark_app_valid_cancel_rollback();
+        }
+    }
+    Serial.printf("Firmware: v%s, partition: %s\n", FW_VERSION, running ? running->label : "?");
 
     // Factory reset: hold BtnA during boot for 5 seconds
     M5.update();
@@ -652,12 +964,88 @@ void loop() {
     }
 
     case STATE_WIFI_CONNECTING: {
+        // Long-press BtnA to immediately enter WiFi setup (keeps pairing token)
+        {
+            M5.update();
+            if (M5.BtnA.isPressed()) {
+                unsigned long holdStart = millis();
+                while (true) {
+                    M5.update();
+                    if (!M5.BtnA.isPressed()) break;
+                    unsigned long held = (millis() - holdStart) / 1000;
+                    if (held >= 2) {
+                        prefs.begin("audio", false);
+                        prefs.remove("ssid");
+                        prefs.remove("pass");
+                        prefs.end();
+                        showCentered("WiFi RST", RED);
+                        delay(1000);
+                        ESP.restart();
+                    }
+                    M5.Display.fillScreen(BLACK);
+                    M5.Display.setTextSize(2);
+                    M5.Display.setTextColor(YELLOW, BLACK);
+                    M5.Display.setCursor(15, 15);
+                    M5.Display.print("RESET WiFi?");
+                    M5.Display.setCursor(15, 50);
+                    M5.Display.printf("Hold %lus more...", 2 - held);
+                    delay(100);
+                }
+            }
+        }
+
         if (connectWiFi()) {
-            appState = STATE_CHECK_PAIRED;
+            wifiRetryCount = 0;
+            appState = STATE_OTA_CHECK;
         } else {
-            showTwoLines("NO WiFi", "Retry in 5s", RED);
-            Serial.println("WiFi failed. Hold BtnA at boot to reconfigure.");
-            delay(5000);
+            wifiRetryCount++;
+            if (wifiRetryCount >= MAX_WIFI_RETRIES) {
+                Serial.println("WiFi failed too many times, entering setup portal...");
+                wifiRetryCount = 0;
+                appState = STATE_SETUP;
+                startCaptivePortal();
+            } else {
+                M5.Display.fillScreen(BLACK);
+                M5.Display.setTextSize(2);
+                M5.Display.setTextColor(RED, BLACK);
+                M5.Display.setCursor(15, 10);
+                M5.Display.print("NO WiFi");
+                M5.Display.setTextSize(1);
+                M5.Display.setTextColor(YELLOW, BLACK);
+                M5.Display.setCursor(15, 40);
+                M5.Display.printf("Retry %d/%d in 5s", wifiRetryCount, MAX_WIFI_RETRIES);
+                M5.Display.setTextColor(DARKGREY, BLACK);
+                M5.Display.setCursor(15, 60);
+                M5.Display.print("Hold btn -> WiFi setup");
+                delay(5000);
+            }
+        }
+        break;
+    }
+
+    case STATE_OTA_CHECK: {
+        if (deviceToken.length() == 0) {
+            // Not paired yet, skip OTA check
+            appState = STATE_CHECK_PAIRED;
+            break;
+        }
+        showCentered("CHECK..", YELLOW, 2);
+        Serial.println("Checking for OTA update...");
+        if (checkForOtaUpdate()) {
+            Serial.printf("OTA update available: v%s\n", otaVersion.c_str());
+            appState = STATE_OTA_UPDATING;
+        } else {
+            Serial.println("No OTA update available");
+            lastOtaCheck = millis();
+            appState = STATE_CHECK_PAIRED;
+        }
+        break;
+    }
+
+    case STATE_OTA_UPDATING: {
+        if (!performOtaUpdate()) {
+            // OTA failed, continue normal boot
+            appState = STATE_CHECK_PAIRED;
         }
         break;
     }
@@ -714,7 +1102,7 @@ void loop() {
         showCentered("CLOUD..", YELLOW);
         if (connectWebSocket()) {
             appState = STATE_READY;
-            showCentered("READY", GREEN);
+            showCentered("READY", CYAN);
             drawBattery();
             screenWake();
             Serial.printf("Connected to cloud. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
@@ -732,6 +1120,34 @@ void loop() {
             break;
         }
 
+        // Periodic OTA check (every hour)
+        if (millis() - lastOtaCheck >= OTA_CHECK_INTERVAL) {
+            lastOtaCheck = millis();
+            Serial.println("Periodic OTA check...");
+            if (checkForOtaUpdate()) {
+                showTwoLines("UPDATE", otaVersion.c_str(), CYAN);
+                drawBattery();
+                screenWake();
+                Serial.printf("OTA available: v%s -- press BtnA to update\n", otaVersion.c_str());
+                unsigned long waitStart = millis();
+                bool accepted = false;
+                while (millis() - waitStart < 10000) {
+                    M5.update();
+                    if (M5.BtnA.wasPressed()) {
+                        accepted = true;
+                        break;
+                    }
+                    delay(50);
+                }
+                if (accepted) {
+                    appState = STATE_OTA_UPDATING;
+                    break;
+                }
+                showCentered("READY", CYAN);
+                drawBattery();
+            }
+        }
+
         if (screenOn && millis() - screenOnMs >= SCREEN_TIMEOUT) {
             screenSleep();
         }
@@ -739,7 +1155,7 @@ void loop() {
         if (M5.BtnA.wasPressed()) {
             if (!screenOn) {
                 screenWake();
-                showCentered("READY", GREEN);
+                showCentered("READY", CYAN);
                 drawBattery();
             } else {
                 Serial.println("Starting stream...");
@@ -802,7 +1218,7 @@ void loop() {
 
             appState = STATE_READY;
             screenWake();
-            showCentered("READY", GREEN);
+            showCentered("READY", CYAN);
             drawBattery();
             break;
         }

@@ -7,7 +7,9 @@ transcription (ElevenLabs Scribe), LLM processing, and serves the web portal.
 """
 
 import asyncio
+import hashlib
 import json
+import os
 import secrets
 import struct
 import wave
@@ -15,16 +17,17 @@ import io
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from packaging.version import Version
 
 from database import init_db, get_db, async_session
-from models import User, Device, Session, SessionStatus, Transcription, Note, NoteType
+from models import User, Device, Session, SessionStatus, Transcription, Note, NoteType, FirmwareVersion
 from auth import hash_password, verify_password, create_access_token, get_current_user
 from adpcm import AdpcmDecoder
 from config import ELEVENLABS_API_KEY, OPENAI_API_KEY, PAIRING_CODE_EXPIRY_SECONDS
@@ -227,6 +230,145 @@ async def update_device_wifi(
         raise HTTPException(status_code=409, detail="Device connection lost")
 
     return {"status": "sent", "device_id": device_id}
+
+
+# ═══════════════════════════════════════════════════════════════
+# REST API: OTA Firmware Updates
+# ═══════════════════════════════════════════════════════════════
+
+FIRMWARE_DIR = os.path.join(os.path.dirname(__file__), "firmware")
+os.makedirs(FIRMWARE_DIR, exist_ok=True)
+
+
+async def authenticate_device(token: str, mac: str, db: AsyncSession) -> Device:
+    result = await db.execute(
+        select(Device).where(Device.api_token == token, Device.mac_address == mac)
+    )
+    device = result.scalar_one_or_none()
+    if not device or not device.user_id:
+        raise HTTPException(status_code=401, detail="Invalid device credentials")
+    return device
+
+
+@app.get("/api/ota/check")
+async def check_ota(
+    mac: str,
+    version: str,
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Device polls this to check if a newer firmware is available."""
+    device = await authenticate_device(token, mac, db)
+
+    device.firmware_version = version
+    await db.commit()
+
+    result = await db.execute(
+        select(FirmwareVersion)
+        .where(FirmwareVersion.is_active == 1)
+        .order_by(FirmwareVersion.created_at.desc())
+    )
+    firmwares = result.scalars().all()
+
+    try:
+        current = Version(version)
+    except Exception:
+        return {"update": False}
+
+    for fw in firmwares:
+        try:
+            if Version(fw.version) > current:
+                return {
+                    "update": True,
+                    "version": fw.version,
+                    "firmware_id": fw.id,
+                    "sha256": fw.sha256,
+                    "size": fw.file_size,
+                }
+        except Exception:
+            continue
+
+    return {"update": False}
+
+
+@app.get("/api/ota/firmware/{firmware_id}")
+async def download_firmware(
+    firmware_id: int,
+    token: str,
+    mac: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Device downloads the firmware binary for OTA flashing."""
+    await authenticate_device(token, mac, db)
+
+    result = await db.execute(
+        select(FirmwareVersion).where(FirmwareVersion.id == firmware_id)
+    )
+    fw = result.scalar_one_or_none()
+    if not fw:
+        raise HTTPException(status_code=404, detail="Firmware not found")
+
+    filepath = os.path.join(FIRMWARE_DIR, fw.filename)
+    if not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail="Firmware file missing from disk")
+
+    def iter_file():
+        with open(filepath, "rb") as f:
+            while chunk := f.read(4096):
+                yield chunk
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(fw.file_size),
+            "X-Firmware-SHA256": fw.sha256,
+        },
+    )
+
+
+@app.post("/api/ota/upload", status_code=201)
+async def upload_firmware(
+    file: UploadFile = File(...),
+    version: str = Form(...),
+    release_notes: str = Form(""),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a new firmware binary. Auth: user JWT."""
+    existing = await db.execute(
+        select(FirmwareVersion).where(FirmwareVersion.version == version)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Version {version} already exists")
+
+    contents = await file.read()
+    sha256 = hashlib.sha256(contents).hexdigest()
+    filename = f"{version}.bin"
+    filepath = os.path.join(FIRMWARE_DIR, filename)
+
+    with open(filepath, "wb") as f:
+        f.write(contents)
+
+    fw = FirmwareVersion(
+        version=version,
+        filename=filename,
+        sha256=sha256,
+        file_size=len(contents),
+        release_notes=release_notes or None,
+    )
+    db.add(fw)
+    await db.commit()
+    await db.refresh(fw)
+
+    print(f"Firmware uploaded: v{version}, {len(contents)} bytes, sha256={sha256[:16]}...")
+
+    return {
+        "id": fw.id,
+        "version": fw.version,
+        "sha256": fw.sha256,
+        "size": fw.file_size,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -462,7 +604,17 @@ async def ws_device(websocket: WebSocket):
     device_id = device.id
     device_connections[device_id] = websocket
     await websocket.send_json({"type": "auth_ok"})
-    print(f"Device connected: MAC={mac}, device_id={device_id}, user_id={user_id}")
+
+    fw_version = websocket.query_params.get("fw", "")
+    if fw_version:
+        async with async_session() as db_fw:
+            result_fw = await db_fw.execute(select(Device).where(Device.id == device_id))
+            dev = result_fw.scalar_one_or_none()
+            if dev:
+                dev.firmware_version = fw_version
+                await db_fw.commit()
+
+    print(f"Device connected: MAC={mac}, device_id={device_id}, user_id={user_id}, fw={fw_version}")
 
     decoder = AdpcmDecoder()
     audio_pcm = bytearray()

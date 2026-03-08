@@ -31,6 +31,8 @@ class Device(Base):
     pairing_code_expires_at = Column(DateTime, nullable=True)
     paired_at = Column(DateTime, nullable=True)
     name = Column(String(100), default="M5-Audio")
+    firmware_version = Column(String(20), nullable=True)
+    last_ota_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="devices")
     sessions = relationship("Session", back_populates="device")
@@ -89,3 +91,16 @@ class Note(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("Session", back_populates="notes")
+
+
+class FirmwareVersion(Base):
+    __tablename__ = "firmware_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    version = Column(String(20), unique=True, nullable=False)
+    filename = Column(String(255), nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    release_notes = Column(Text, nullable=True)
+    is_active = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.utcnow)
