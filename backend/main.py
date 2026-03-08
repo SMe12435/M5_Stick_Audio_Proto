@@ -527,7 +527,46 @@ async def ws_device(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print(f"Device disconnected: MAC={mac}")
-        if streaming and current_session_id:
+        if streaming and current_session_id and len(audio_pcm) > 0:
+            duration = len(audio_pcm) / 2 / sample_rate
+            print(f"  Disconnect mid-stream: {len(audio_pcm)} bytes ({duration:.1f}s), {chunk_count} chunks -- processing audio")
+
+            await notify_user(user_id, {
+                "type": "stream_end",
+                "session_id": current_session_id,
+                "duration": round(duration, 1),
+                "chunks": chunk_count,
+                "disconnected": True,
+            })
+
+            pcm_copy = bytes(audio_pcm)
+            sid = current_session_id
+            uid = user_id
+            sr = sample_rate
+
+            async def process_disconnected_session():
+                async with async_session() as db:
+                    s = await db.execute(select(Session).where(Session.id == sid))
+                    session = s.scalar_one_or_none()
+                    if session:
+                        session.ended_at = datetime.utcnow()
+                        session.status = SessionStatus.PROCESSING
+                        await db.commit()
+
+                transcript = await run_transcription(sid, uid, bytearray(pcm_copy), sr)
+                if transcript:
+                    await run_llm_processing(sid, uid, transcript)
+                else:
+                    async with async_session() as db:
+                        s = await db.execute(select(Session).where(Session.id == sid))
+                        session = s.scalar_one_or_none()
+                        if session:
+                            session.status = SessionStatus.DONE
+                            await db.commit()
+
+            asyncio.create_task(process_disconnected_session())
+        elif streaming and current_session_id:
+            print(f"  Disconnect mid-stream but no audio accumulated")
             async with async_session() as db:
                 s = await db.execute(select(Session).where(Session.id == current_session_id))
                 session = s.scalar_one_or_none()
@@ -537,6 +576,14 @@ async def ws_device(websocket: WebSocket):
                     await db.commit()
     except Exception as e:
         print(f"Device WS error: {e}")
+        if streaming and current_session_id:
+            async with async_session() as db:
+                s = await db.execute(select(Session).where(Session.id == current_session_id))
+                session = s.scalar_one_or_none()
+                if session:
+                    session.ended_at = datetime.utcnow()
+                    session.status = SessionStatus.DONE
+                    await db.commit()
 
 
 # ═══════════════════════════════════════════════════════════════
