@@ -251,6 +251,31 @@ static void onWsMessage(WebsocketsMessage msg) {
 
     if (data.indexOf("\"auth_ok\"") >= 0) {
         Serial.println("WebSocket authenticated");
+    } else if (data.indexOf("\"wifi_update\"") >= 0) {
+        // Extract ssid field
+        int ssidStart = data.indexOf("\"ssid\":\"") + 8;
+        int ssidEnd = data.indexOf("\"", ssidStart);
+        // Extract password field
+        int passStart = data.indexOf("\"password\":\"") + 12;
+        int passEnd = data.indexOf("\"", passStart);
+
+        if (ssidStart > 7 && ssidEnd > ssidStart && passStart > 11 && passEnd > passStart) {
+            String newSsid = data.substring(ssidStart, ssidEnd);
+            String newPass = data.substring(passStart, passEnd);
+
+            Serial.printf("WiFi update received: ssid='%s'\n", newSsid.c_str());
+
+            prefs.begin("audio", false);
+            prefs.putString("ssid", newSsid);
+            prefs.putString("pass", newPass);
+            prefs.end();
+
+            showCentered("WiFi OK!", GREEN);
+            delay(1500);
+            showCentered("Reboot..", YELLOW);
+            delay(500);
+            ESP.restart();
+        }
     } else if (data.indexOf("\"paired\"") >= 0) {
         int tokenStart = data.indexOf("\"token\":\"") + 9;
         int tokenEnd = data.indexOf("\"", tokenStart);

@@ -379,6 +379,7 @@
             <button class="tab active" onclick="switchTab('live')">Live</button>
             <button class="tab" onclick="switchTab('pair')">Pair Device</button>
             <button class="tab" onclick="switchTab('sessions')">Sessions</button>
+            <button class="tab" onclick="switchTab('settings')">Settings</button>
         </div>
 
         <!-- Live Tab -->
@@ -416,6 +417,31 @@
             <div id="sessions-empty" class="empty-state hidden">
                 <p>No recording sessions yet.</p>
                 <p>Press Button A on your M5StickC to start recording.</p>
+            </div>
+        </div>
+
+        <!-- Settings Tab -->
+        <div id="panel-settings" class="panel">
+            <div class="pair-card" style="text-align:left">
+                <h3 style="text-align:center">Device WiFi Settings</h3>
+                <p style="text-align:center">Push new WiFi credentials to your connected device</p>
+                <div class="form-group">
+                    <label>Device</label>
+                    <select id="settings-device" style="width:100%;padding:10px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:15px;outline:none">
+                        <option value="">Loading devices...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>WiFi Network Name (SSID)</label>
+                    <input type="text" id="settings-ssid" placeholder="e.g. MyHomeWiFi">
+                </div>
+                <div class="form-group">
+                    <label>WiFi Password</label>
+                    <input type="password" id="settings-password" placeholder="WiFi password">
+                </div>
+                <button class="btn btn-primary" onclick="sendWifiUpdate()" id="settings-btn" style="margin-top:8px">Send to Device</button>
+                <div id="settings-success" class="pair-success" style="text-align:center">WiFi credentials sent! Device will reboot.</div>
+                <div id="settings-error" class="error-msg" style="margin-top:12px"></div>
             </div>
         </div>
 
@@ -499,14 +525,16 @@ async function showDashboard() {
 }
 
 // ── Tabs ──
+const TAB_NAMES = ['live','pair','sessions','settings'];
 function switchTab(name) {
     document.querySelectorAll('.tab').forEach((t, i) => {
-        t.classList.toggle('active', ['live','pair','sessions'][i] === name);
+        t.classList.toggle('active', TAB_NAMES[i] === name);
     });
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     const panel = document.getElementById('panel-' + name);
     if (panel) panel.classList.add('active');
     if (name === 'sessions') loadSessions();
+    if (name === 'settings') loadDevicesForSettings();
 }
 
 // ── User WebSocket ──
@@ -725,12 +753,72 @@ async function viewSession(id) {
 }
 
 function backToSessions() {
-    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-    document.getElementById('panel-sessions').classList.add('active');
-    document.querySelectorAll('.tab').forEach((t, i) => {
-        t.classList.toggle('active', i === 2);
-    });
-    loadSessions();
+    switchTab('sessions');
+}
+
+// ── Settings: WiFi Update ──
+async function loadDevicesForSettings() {
+    const sel = document.getElementById('settings-device');
+    try {
+        const res = await fetch(API_BASE + '/api/devices', {
+            headers: { 'Authorization': 'Bearer ' + authToken },
+        });
+        const devices = await res.json();
+        if (devices.length === 0) {
+            sel.innerHTML = '<option value="">No paired devices</option>';
+            return;
+        }
+        sel.innerHTML = devices.map(d =>
+            `<option value="${d.id}">${d.name || d.mac_address}${d.online ? ' (online)' : ' (offline)'}</option>`
+        ).join('');
+    } catch (err) {
+        sel.innerHTML = '<option value="">Failed to load devices</option>';
+    }
+}
+
+async function sendWifiUpdate() {
+    const deviceId = document.getElementById('settings-device').value;
+    const ssid = document.getElementById('settings-ssid').value.trim();
+    const password = document.getElementById('settings-password').value;
+
+    document.getElementById('settings-success').style.display = 'none';
+    document.getElementById('settings-error').style.display = 'none';
+
+    if (!deviceId) { showSettingsError('Please select a device'); return; }
+    if (!ssid) { showSettingsError('Please enter a WiFi network name'); return; }
+
+    const btn = document.getElementById('settings-btn');
+    btn.textContent = 'Sending...';
+    btn.disabled = true;
+
+    try {
+        const res = await fetch(API_BASE + '/api/devices/' + deviceId + '/wifi', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + authToken,
+            },
+            body: JSON.stringify({ ssid, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Failed to send WiFi update');
+
+        document.getElementById('settings-success').style.display = 'block';
+        document.getElementById('settings-ssid').value = '';
+        document.getElementById('settings-password').value = '';
+    } catch (err) {
+        showSettingsError(err.message);
+    } finally {
+        btn.textContent = 'Send to Device';
+        btn.disabled = false;
+    }
+}
+
+function showSettingsError(msg) {
+    const el = document.getElementById('settings-error');
+    el.textContent = msg;
+    el.style.display = 'block';
+    document.getElementById('settings-success').style.display = 'none';
 }
 
 // ── Init ──

@@ -39,8 +39,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Connected user WebSockets (user_id -> list of websockets) ──
-user_connections: dict[int, list[WebSocket]] = {}
+# ── Connected WebSockets ──
+user_connections: dict[int, list[WebSocket]] = {}    # user_id -> list of browser sockets
+device_connections: dict[int, WebSocket] = {}         # device_id -> device socket
 
 
 @app.on_event("startup")
@@ -180,9 +181,52 @@ async def list_devices(user: User = Depends(get_current_user), db: AsyncSession 
     result = await db.execute(select(Device).where(Device.user_id == user.id))
     devices = result.scalars().all()
     return [
-        {"id": d.id, "name": d.name, "mac_address": d.mac_address, "paired_at": str(d.paired_at)}
+        {
+            "id": d.id,
+            "name": d.name,
+            "mac_address": d.mac_address,
+            "paired_at": str(d.paired_at),
+            "online": d.id in device_connections,
+        }
         for d in devices
     ]
+
+
+class WifiUpdateRequest(BaseModel):
+    ssid: str
+    password: str
+
+
+@app.post("/api/devices/{device_id}/wifi")
+async def update_device_wifi(
+    device_id: int,
+    req: WifiUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Push new WiFi credentials to a connected device."""
+    result = await db.execute(
+        select(Device).where(Device.id == device_id, Device.user_id == user.id)
+    )
+    device = result.scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    ws = device_connections.get(device_id)
+    if not ws:
+        raise HTTPException(status_code=409, detail="Device is offline")
+
+    try:
+        await ws.send_json({
+            "type": "wifi_update",
+            "ssid": req.ssid,
+            "password": req.password,
+        })
+    except Exception:
+        device_connections.pop(device_id, None)
+        raise HTTPException(status_code=409, detail="Device connection lost")
+
+    return {"status": "sent", "device_id": device_id}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -416,6 +460,7 @@ async def ws_device(websocket: WebSocket):
 
     user_id = device.user_id
     device_id = device.id
+    device_connections[device_id] = websocket
     await websocket.send_json({"type": "auth_ok"})
     print(f"Device connected: MAC={mac}, device_id={device_id}, user_id={user_id}")
 
@@ -526,6 +571,7 @@ async def ws_device(websocket: WebSocket):
                 })
 
     except WebSocketDisconnect:
+        device_connections.pop(device_id, None)
         print(f"Device disconnected: MAC={mac}")
         if streaming and current_session_id and len(audio_pcm) > 0:
             duration = len(audio_pcm) / 2 / sample_rate
@@ -575,6 +621,7 @@ async def ws_device(websocket: WebSocket):
                     session.status = SessionStatus.DONE
                     await db.commit()
     except Exception as e:
+        device_connections.pop(device_id, None)
         print(f"Device WS error: {e}")
         if streaming and current_session_id:
             async with async_session() as db:
