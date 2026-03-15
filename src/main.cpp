@@ -1,214 +1,135 @@
 #include <M5Unified.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <DNSServer.h>
-#include <ArduinoWebsockets.h>
-#include <Preferences.h>
-#include <esp_wifi.h>
-#include <esp_system.h>
-#include <esp_ota_ops.h>
-#include <esp_http_client.h>
-#include <esp_partition.h>
-#include "version.h"
+#include "BluetoothA2DPSink.h"
+#include "esp_hf_client_api.h"
+#include "esp_log.h"
 
-using namespace websockets;
+static const char* TAG = "M5HFP";
 
-// ── Defaults ─────────────────────────────────────────────
-static const char* DEFAULT_SERVER = "ws://15.206.232.216:8888/ws/device";
-static const char* AP_SSID        = "M5Audio-Setup";
+// ── Serial Protocol ─────────────────────────────────────
+//   Frame: [0xAA][0x55][TYPE:1][LEN:2 LE][PAYLOAD:LEN bytes]
+//   TYPE 0x01 = BT audio PCM  (A2DP or HFP — mutually exclusive)
+//   TYPE 0x02 = MIC audio PCM
+//   TYPE 0x80 = Session start (16-byte payload: BT sr/ch/bps + MIC sr/ch/bps)
+//   TYPE 0xFF = Session end (0-byte payload)
+static constexpr uint32_t SERIAL_BAUD = 3000000;
 
-// ── Audio Settings ──────────────────────────────────────
-static constexpr uint32_t SAMPLE_RATE = 16000;
-static constexpr size_t   MIC_CHUNK  = 512;
+// ── Audio Formats ───────────────────────────────────────
+static constexpr uint32_t A2DP_SAMPLE_RATE = 44100;
+static constexpr uint16_t A2DP_CHANNELS   = 2;
+static constexpr uint16_t A2DP_BPS        = 16;
 
-// ── IMA ADPCM Tables ───────────────────────────────────
-static const int16_t ADPCM_STEP_TABLE[89] = {
-    7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,
-    50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,
-    230,253,279,307,337,371,408,449,494,544,598,658,724,796,
-    876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,
-    2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,
-    7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,
-    20350,22385,24623,27086,29794,32767
-};
+static constexpr uint32_t HFP_SAMPLE_RATE_NB = 8000;   // CVSD narrowband
+static constexpr uint32_t HFP_SAMPLE_RATE_WB = 16000;  // mSBC wideband
+static constexpr uint16_t HFP_CHANNELS       = 1;
+static constexpr uint16_t HFP_BPS            = 16;
 
-static const int8_t ADPCM_INDEX_TABLE[16] = {
-    -1,-1,-1,-1, 2,4,6,8,
-    -1,-1,-1,-1, 2,4,6,8
-};
+static constexpr uint32_t MIC_SAMPLE_RATE = 16000;
+static constexpr uint16_t MIC_CHANNELS    = 1;
+static constexpr uint16_t MIC_BPS         = 16;
+static constexpr size_t   MIC_CHUNK       = 512;
 
-// ── ADPCM Encoder State ────────────────────────────────
-struct AdpcmState {
-    int16_t predictor;
-    int8_t  index;
-};
+// ── Frame Types ─────────────────────────────────────────
+static constexpr uint8_t FRAME_BT_DATA      = 0x01;
+static constexpr uint8_t FRAME_MIC_DATA     = 0x02;
+static constexpr uint8_t FRAME_SESSION_START = 0x80;
+static constexpr uint8_t FRAME_SESSION_END   = 0xFF;
 
-static AdpcmState adpcmState;
+// ── PSRAM Ring Buffer ───────────────────────────────────
+struct RingBuf {
+    uint8_t* buf;
+    size_t   cap;
+    volatile size_t head;
+    volatile size_t tail;
 
-static uint8_t adpcm_encode_sample(int16_t sample) {
-    int step = ADPCM_STEP_TABLE[adpcmState.index];
-    int diff = sample - adpcmState.predictor;
-    uint8_t nibble = 0;
-
-    if (diff < 0) {
-        nibble = 8;
-        diff = -diff;
+    void init(size_t capacity) {
+        buf = (uint8_t*)ps_malloc(capacity);
+        cap = buf ? capacity : 0;
+        head = tail = 0;
     }
 
-    if (diff >= step) { nibble |= 4; diff -= step; }
-    if (diff >= (step >> 1)) { nibble |= 2; diff -= (step >> 1); }
-    if (diff >= (step >> 2)) { nibble |= 1; }
-
-    int delta = (step >> 3);
-    if (nibble & 4) delta += step;
-    if (nibble & 2) delta += (step >> 1);
-    if (nibble & 1) delta += (step >> 2);
-
-    if (nibble & 8)
-        adpcmState.predictor -= delta;
-    else
-        adpcmState.predictor += delta;
-
-    if (adpcmState.predictor > 32767)  adpcmState.predictor = 32767;
-    if (adpcmState.predictor < -32768) adpcmState.predictor = -32768;
-
-    adpcmState.index += ADPCM_INDEX_TABLE[nibble];
-    if (adpcmState.index < 0)  adpcmState.index = 0;
-    if (adpcmState.index > 88) adpcmState.index = 88;
-
-    return nibble;
-}
-
-static void adpcm_encode_block(const int16_t* pcm, uint8_t* out, size_t numSamples) {
-    for (size_t i = 0; i < numSamples; i += 2) {
-        uint8_t lo = adpcm_encode_sample(pcm[i]);
-        uint8_t hi = adpcm_encode_sample(pcm[i + 1]);
-        out[i / 2] = (hi << 4) | (lo & 0x0F);
+    size_t available() const {
+        size_t h = head, t = tail;
+        return (h >= t) ? (h - t) : (cap - t + h);
     }
-}
 
-// ── State Machine ───────────────────────────────────────
-enum AppState {
-    STATE_SETUP,
-    STATE_WIFI_CONNECTING,
-    STATE_OTA_CHECK,
-    STATE_CHECK_PAIRED,
-    STATE_PAIRING,
-    STATE_WS_CONNECTING,
-    STATE_READY,
-    STATE_STREAMING,
-    STATE_OTA_UPDATING
+    size_t freeSpace() const {
+        return cap - available() - 1;
+    }
+
+    bool write(const uint8_t* data, size_t len) {
+        if (len > freeSpace()) return false;
+        size_t h = head;
+        for (size_t i = 0; i < len; i++) {
+            buf[h] = data[i];
+            h = (h + 1) % cap;
+        }
+        head = h;
+        return true;
+    }
+
+    size_t read(uint8_t* dst, size_t maxLen) {
+        size_t avail = available();
+        size_t toRead = (maxLen < avail) ? maxLen : avail;
+        size_t t = tail;
+        for (size_t i = 0; i < toRead; i++) {
+            dst[i] = buf[t];
+            t = (t + 1) % cap;
+        }
+        tail = t;
+        return toRead;
+    }
+
+    void flush() { tail = head; }
 };
-static volatile AppState appState = STATE_SETUP;
 
-// ── Globals ─────────────────────────────────────────────
-static int16_t  pcmChunk[MIC_CHUNK];
-static uint8_t  adpcmBuf[MIC_CHUNK / 2];
-static int32_t  dcOffset       = 0;
-static unsigned long streamStartMs = 0;
+static RingBuf btRing;
+static RingBuf micRing;
 
-static WebsocketsClient wsClient;
-static bool wsConnected = false;
-static Preferences prefs;
+static constexpr size_t BT_RING_SIZE  = 65536;
+static constexpr size_t MIC_RING_SIZE = 16384;
 
-static String cfgSsid;
-static String cfgPassword;
-static String cfgServerUrl;
+// ── HFP outgoing mic ring (separate from serial-capture mic ring) ──
+static RingBuf hfpMicRing;
+static constexpr size_t HFP_MIC_RING_SIZE = 4096;
 
-static String deviceToken;
-static String pairingCode;
-static String deviceMac;
+// ── A2DP ────────────────────────────────────────────────
+static BluetoothA2DPSink a2dpSink;
+static const char* BT_DEVICE_NAME = "M5Audio";
 
-static unsigned long lastWsReconnect = 0;
-static constexpr unsigned long WS_RECONNECT_INTERVAL = 5000;
+// ── State ───────────────────────────────────────────────
+static volatile bool btConnected     = false;
+static volatile bool audioStreaming   = false;
+static volatile bool sessionStarted  = false;
+static volatile uint32_t btTotalBytes  = 0;
+static volatile uint32_t micTotalBytes = 0;
+static unsigned long streamStartMs   = 0;
 
-static unsigned long lastPairingPoll = 0;
-static constexpr unsigned long PAIRING_POLL_INTERVAL = 3000;
+// ── HFP State ───────────────────────────────────────────
+static volatile bool hfpConnected    = false;
+static volatile bool hfpCallActive   = false;
+static volatile bool hfpAudioActive  = false;
+static volatile uint32_t hfpSampleRate = HFP_SAMPLE_RATE_NB;
+static esp_bd_addr_t hfpPeerAddr;
 
-// ── WiFi Retry / Auto-Fallback ─────────────────────────
-static int wifiRetryCount = 0;
-static constexpr int MAX_WIFI_RETRIES = 3;
+// Active BT audio format (changes between A2DP and HFP sessions)
+static volatile uint32_t activeBtSampleRate = A2DP_SAMPLE_RATE;
+static volatile uint16_t activeBtChannels   = A2DP_CHANNELS;
 
-// ── Screen Power Management ────────────────────────────
+// ── Screen ──────────────────────────────────────────────
 static bool screenOn = true;
-static unsigned long screenOnMs = 0;
-static constexpr unsigned long SCREEN_TIMEOUT = 5000;
+static unsigned long lastDisplayUpdate = 0;
+static constexpr unsigned long DISPLAY_INTERVAL = 500;
 
-// ── WebSocket Keepalive ────────────────────────────────
-static unsigned long lastWsPing = 0;
-static constexpr unsigned long WS_PING_INTERVAL = 15000;
+// ── Audio levels (for display) ──────────────────────────
+static volatile int16_t btPeakLevel  = 0;
+static volatile int16_t micPeakLevel = 0;
 
-// ── OTA Update Globals ─────────────────────────────────
-static String otaFirmwareUrl;
-static String otaSha256;
-static String otaVersion;
-static int    otaFileSize = 0;
-static unsigned long lastOtaCheck = 0;
-static constexpr unsigned long OTA_CHECK_INTERVAL = 3600000; // 1 hour
+// ── Mic buffer ──────────────────────────────────────────
+static int16_t micPcmBuf[MIC_CHUNK];
 
-// ── Canvas Art (Pixel Doodle) ──────────────────────────
-static constexpr int CANVAS_W = 48;
-static constexpr int CANVAS_H = 27;
-static constexpr int CANVAS_PIXELS = CANVAS_W * CANVAS_H;
-static constexpr int CANVAS_BYTES  = CANVAS_PIXELS * 2; // RGB565
-static uint16_t canvasPixels[CANVAS_PIXELS];
-static bool hasCanvasArt   = false;
-static bool showingCanvas  = false;
-
-static const uint8_t B64_LUT[128] = {
-    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
-    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
-    64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
-    52,53,54,55,56,57,58,59,60,61,64,64,64, 0,64,64,
-    64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-    15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
-    64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-    41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64
-};
-
-static int base64Decode(const char* src, int srcLen, uint8_t* dst, int dstCap) {
-    int out = 0;
-    uint32_t buf = 0;
-    int bits = 0;
-    for (int i = 0; i < srcLen && out < dstCap; i++) {
-        char c = src[i];
-        if (c == '=' || c < 0 || c > 127) continue;
-        uint8_t v = B64_LUT[(int)c];
-        if (v > 63) continue;
-        buf = (buf << 6) | v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            dst[out++] = (buf >> bits) & 0xFF;
-        }
-    }
-    return out;
-}
-
-static void renderCanvasToDisplay() {
-    for (int y = 0; y < CANVAS_H; y++) {
-        for (int x = 0; x < CANVAS_W; x++) {
-            uint16_t color = canvasPixels[y * CANVAS_W + x];
-            M5.Display.fillRect(x * 5, y * 5, 5, 5, color);
-        }
-    }
-}
-
-// ── Captive Portal Globals ──────────────────────────────
-static WebServer*  portalServer = nullptr;
-static DNSServer*  portalDns    = nullptr;
-static String      portalHtml;
-
-// ── Pairing Code Generation ─────────────────────────────
-static const char PAIRING_CHARS[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-
-static String generatePairingCode() {
-    String code = "";
-    for (int i = 0; i < 6; i++) {
-        code += PAIRING_CHARS[esp_random() % (sizeof(PAIRING_CHARS) - 1)];
-    }
-    return code;
-}
+// ── Serial drain buffer ─────────────────────────────────
+static constexpr size_t DRAIN_CHUNK = 1024;
+static uint8_t drainBuf[DRAIN_CHUNK];
 
 // ── Display Helpers ─────────────────────────────────────
 static void showCentered(const char* msg, uint16_t color, uint8_t size = 3) {
@@ -219,73 +140,6 @@ static void showCentered(const char* msg, uint16_t color, uint8_t size = 3) {
     int16_t y = (M5.Display.height() - size * 8) / 2;
     M5.Display.setCursor(x, y);
     M5.Display.print(msg);
-}
-
-static void showTwoLines(const char* line1, const char* line2, uint16_t color) {
-    M5.Display.fillScreen(BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(color, BLACK);
-    int16_t x1 = (M5.Display.width() - M5.Display.textWidth(line1)) / 2;
-    M5.Display.setCursor(x1, 20);
-    M5.Display.print(line1);
-    M5.Display.setTextSize(3);
-    int16_t x2 = (M5.Display.width() - M5.Display.textWidth(line2)) / 2;
-    M5.Display.setCursor(x2, 48);
-    M5.Display.print(line2);
-}
-
-static void showStreaming(int seconds, const int16_t* samples, size_t count) {
-    M5.Display.fillScreen(BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(RED, BLACK);
-    M5.Display.setCursor(20, 10);
-    M5.Display.printf("STREAM  %ds", seconds);
-
-    if (count > 0) {
-        int32_t sum = 0;
-        for (size_t i = 0; i < count; i++)
-            sum += abs(samples[i]);
-        int avg = sum / count;
-        int barW = constrain(avg / 6, 0, M5.Display.width() - 20);
-        M5.Display.fillRect(10, 55, barW, 14, GREEN);
-        M5.Display.fillRect(10 + barW, 55, M5.Display.width() - 20 - barW, 14, DARKGREY);
-    }
-}
-
-static void showSetupScreen() {
-    M5.Display.fillScreen(BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(CYAN, BLACK);
-    M5.Display.setCursor(30, 8);
-    M5.Display.print("SETUP MODE");
-
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(WHITE, BLACK);
-    M5.Display.setCursor(10, 40);
-    M5.Display.print("Connect phone WiFi to:");
-
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(GREEN, BLACK);
-    int16_t x = (M5.Display.width() - M5.Display.textWidth(AP_SSID)) / 2;
-    M5.Display.setCursor(x, 58);
-    M5.Display.print(AP_SSID);
-
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(DARKGREY, BLACK);
-    M5.Display.setCursor(10, 85);
-    M5.Display.printf("Open http://%s", WiFi.softAPIP().toString().c_str());
-}
-
-// ── Screen Power Helpers ────────────────────────────────
-static void screenWake() {
-    M5.Display.setBrightness(80);
-    screenOn = true;
-    screenOnMs = millis();
-}
-
-static void screenSleep() {
-    M5.Display.setBrightness(10);
-    screenOn = false;
 }
 
 static void drawBattery() {
@@ -299,1052 +153,391 @@ static void drawBattery() {
     M5.Display.print(buf);
 }
 
-// ── DC Offset Removal ───────────────────────────────────
-static void removeDcInPlace(int16_t* buf, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        dcOffset += ((int32_t)buf[i] - dcOffset) >> 8;
-        int32_t val = (int32_t)buf[i] - dcOffset;
-        if (val > 32767)  val = 32767;
-        if (val < -32768) val = -32768;
-        buf[i] = (int16_t)val;
-    }
-}
-
-// ── WebSocket Callbacks ─────────────────────────────────
-static void onWsMessage(WebsocketsMessage msg) {
-    String data = msg.data();
-    Serial.printf("WS recv: %s\n", data.c_str());
-
-    if (data.indexOf("\"auth_ok\"") >= 0) {
-        Serial.println("WebSocket authenticated");
-    } else if (data.indexOf("\"wifi_update\"") >= 0) {
-        // Extract ssid field
-        int ssidStart = data.indexOf("\"ssid\":\"") + 8;
-        int ssidEnd = data.indexOf("\"", ssidStart);
-        // Extract password field
-        int passStart = data.indexOf("\"password\":\"") + 12;
-        int passEnd = data.indexOf("\"", passStart);
-
-        if (ssidStart > 7 && ssidEnd > ssidStart && passStart > 11 && passEnd > passStart) {
-            String newSsid = data.substring(ssidStart, ssidEnd);
-            String newPass = data.substring(passStart, passEnd);
-
-            Serial.printf("WiFi update received: ssid='%s' pass='%s'\n", newSsid.c_str(), newPass.c_str());
-
-            prefs.begin("audio", false);
-            prefs.putString("ssid", newSsid);
-            prefs.putString("pass", newPass);
-            prefs.end();
-
-            M5.Display.fillScreen(BLACK);
-            M5.Display.setTextSize(1);
-            M5.Display.setTextColor(GREEN, BLACK);
-            M5.Display.setCursor(5, 5);
-            M5.Display.print("WiFi Updated!");
-            M5.Display.setTextColor(CYAN, BLACK);
-            M5.Display.setCursor(5, 22);
-            M5.Display.printf("SSID: %s", newSsid.c_str());
-            M5.Display.setCursor(5, 39);
-            M5.Display.printf("PASS: %s", newPass.c_str());
-            M5.Display.setTextColor(YELLOW, BLACK);
-            M5.Display.setCursor(5, 60);
-            M5.Display.print("Rebooting...");
-            delay(4000);
-            ESP.restart();
-        }
-    } else if (data.indexOf("\"paired\"") >= 0) {
-        int tokenStart = data.indexOf("\"token\":\"") + 9;
-        int tokenEnd = data.indexOf("\"", tokenStart);
-        if (tokenStart > 8 && tokenEnd > tokenStart) {
-            deviceToken = data.substring(tokenStart, tokenEnd);
-            prefs.begin("audio", false);
-            prefs.putString("token", deviceToken);
-            prefs.end();
-            Serial.printf("Paired! Token saved: %s...\n", deviceToken.substring(0, 8).c_str());
-            showCentered("PAIRED!", GREEN);
-            delay(1500);
-            appState = STATE_WS_CONNECTING;
-        }
-    } else if (data.indexOf("\"display_update\"") >= 0) {
-        int pxStart = data.indexOf("\"pixels\":\"") + 10;
-        int pxEnd = data.indexOf("\"", pxStart);
-        if (pxStart > 9 && pxEnd > pxStart) {
-            String b64 = data.substring(pxStart, pxEnd);
-            uint8_t rawBuf[CANVAS_BYTES];
-            int decoded = base64Decode(b64.c_str(), b64.length(), rawBuf, CANVAS_BYTES);
-            if (decoded >= CANVAS_BYTES) {
-                memcpy(canvasPixels, rawBuf, CANVAS_BYTES);
-                hasCanvasArt = true;
-                Serial.println("Canvas art received and decoded");
-
-                prefs.begin("audio", false);
-                prefs.putBytes("canvas", canvasPixels, CANVAS_BYTES);
-                prefs.putBool("hasCanvas", true);
-                prefs.end();
-
-                if (appState == STATE_READY && showingCanvas) {
-                    M5.Display.fillScreen(BLACK);
-                    renderCanvasToDisplay();
-                    screenWake();
-                }
-            } else {
-                Serial.printf("Canvas decode failed: got %d, expected %d\n", decoded, CANVAS_BYTES);
-            }
-        }
-    }
-}
-
-static void onWsEvent(WebsocketsEvent event, String data) {
-    switch (event) {
-    case WebsocketsEvent::ConnectionOpened:
-        Serial.println("WS: connected");
-        wsConnected = true;
-        break;
-    case WebsocketsEvent::ConnectionClosed:
-        Serial.printf("WS: disconnected (state=%d, heap=%u, RSSI=%d)\n",
-            (int)appState, (unsigned)ESP.getFreeHeap(), WiFi.RSSI());
-        wsConnected = false;
-        break;
-    case WebsocketsEvent::GotPing:
-        break;
-    case WebsocketsEvent::GotPong:
-        break;
-    }
-}
-
-// ── HTML Escape Helper ──────────────────────────────────
-static String htmlEscape(const String& s) {
-    String out;
-    out.reserve(s.length() + 8);
-    for (unsigned int i = 0; i < s.length(); i++) {
-        char c = s.charAt(i);
-        switch (c) {
-            case '&':  out += "&amp;";  break;
-            case '<':  out += "&lt;";   break;
-            case '>':  out += "&gt;";   break;
-            case '"':  out += "&quot;"; break;
-            case '\'': out += "&#39;";  break;
-            default:   out += c;        break;
-        }
-    }
-    return out;
-}
-
-// ── Captive Portal ──────────────────────────────────────
-static String buildSetupPage(const String& networkItems) {
-    String html = R"rawliteral(<!DOCTYPE html><html><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>M5 Audio Setup</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,system-ui,sans-serif;background:#0f1117;color:#e4e6ef;
-min-height:100vh;display:flex;justify-content:center;padding:20px}
-.card{background:#1a1d27;border:1px solid #2e3144;border-radius:12px;padding:28px 24px;
-width:100%;max-width:400px;margin-top:10px}
-h2{text-align:center;margin-bottom:6px;font-size:22px}
-.sub{text-align:center;color:#8b8fa3;font-size:14px;margin-bottom:20px}
-label{display:block;font-size:13px;color:#8b8fa3;margin:14px 0 6px;font-weight:500}
-input,select{width:100%;padding:10px 14px;background:#242736;border:1px solid #2e3144;
-border-radius:8px;color:#e4e6ef;font-size:15px;outline:none}
-input:focus{border-color:#6c63ff}
-.nets{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.net{padding:6px 12px;background:#242736;border:1px solid #2e3144;border-radius:6px;
-font-size:13px;cursor:pointer;transition:border-color .2s}
-.net:hover,.net:active{border-color:#6c63ff;color:#6c63ff}
-.rssi{color:#8b8fa3;font-size:11px;margin-left:4px}
-details{margin-top:14px}
-summary{color:#8b8fa3;font-size:13px;cursor:pointer}
-button{width:100%;padding:12px;margin-top:20px;background:#6c63ff;color:#fff;border:none;
-border-radius:8px;font-size:16px;font-weight:500;cursor:pointer}
-button:hover{background:#5a52e0}
-</style></head><body>
-<div class="card">
-<h2>M5 Audio Setup</h2>
-<p class="sub">Connect your device to a WiFi hotspot</p>
-<form method="POST" action="/save">
-<label>WiFi Network</label>
-<input type="text" name="ssid" id="ssid" placeholder="Type or tap a network below" required>
-<div class="nets">)rawliteral";
-
-    html += networkItems;
-
-    html += R"rawliteral(</div>
-<label>Password</label>
-<input type="password" name="password" placeholder="Hotspot password">
-<details><summary>Advanced Settings</summary>
-<label>Server URL</label>
-<input name="server" value=")rawliteral";
-
-    html += cfgServerUrl.length() > 0 ? cfgServerUrl : String(DEFAULT_SERVER);
-
-    html += R"rawliteral(">
-</details>
-<button type="submit">Save &amp; Connect</button>
-</form></div>
-<script>
-document.querySelectorAll('.net').forEach(function(el){
-el.onclick=function(){document.getElementById('ssid').value=this.dataset.ssid;};
-});
-</script>
-</body></html>)rawliteral";
-
-    return html;
-}
-
-static void handlePortalRoot() {
-    portalServer->send(200, "text/html", portalHtml);
-}
-
-static void handlePortalSave() {
-    String ssid = portalServer->arg("ssid");
-    String pass = portalServer->arg("password");
-    String server = portalServer->arg("server");
-
-    Serial.printf("Portal save: ssid='%s', pass='%s', server=%s\n", ssid.c_str(), pass.c_str(), server.c_str());
-
-    prefs.begin("audio", false);
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", pass);
-    if (server.length() > 0) {
-        prefs.putString("server", server);
-    }
-    prefs.end();
-
-    M5.Display.fillScreen(BLACK);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(GREEN, BLACK);
-    M5.Display.setCursor(5, 5);
-    M5.Display.print("WiFi Saved!");
-    M5.Display.setTextColor(CYAN, BLACK);
-    M5.Display.setCursor(5, 22);
-    M5.Display.printf("SSID: %s", ssid.c_str());
-    M5.Display.setCursor(5, 39);
-    M5.Display.printf("PASS: %s", pass.c_str());
-    M5.Display.setTextColor(YELLOW, BLACK);
-    M5.Display.setCursor(5, 60);
-    M5.Display.print("Rebooting...");
-
-    portalServer->send(200, "text/html",
-        "<!DOCTYPE html><html><head>"
-        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<style>body{font-family:-apple-system,sans-serif;background:#0f1117;color:#e4e6ef;"
-        "display:flex;justify-content:center;align-items:center;min-height:100vh;text-align:center}"
-        ".ok{font-size:48px;margin-bottom:16px}</style></head><body>"
-        "<div><div class='ok'>&#10003;</div><h2>Saved!</h2><p style='color:#8b8fa3;margin-top:8px'>"
-        "Rebooting and connecting...</p></div></body></html>");
-
-    delay(1500);
-    ESP.restart();
-}
-
-static void startCaptivePortal() {
-    Serial.println("Starting captive portal...");
-
-    WiFi.mode(WIFI_AP_STA);
-    delay(200);
-
-    // Scan for nearby networks
-    Serial.println("Scanning WiFi networks...");
-    int n = WiFi.scanNetworks();
-    String netItems = "";
-    for (int i = 0; i < n; i++) {
-        String ssid = WiFi.SSID(i);
-        int rssi = WiFi.RSSI(i);
-        if (ssid.length() == 0) continue;
-        String escaped = htmlEscape(ssid);
-        netItems += "<div class=\"net\" data-ssid=\"" + escaped + "\">"
-                  + escaped + "<span class=\"rssi\">" + String(rssi) + "dB</span></div>";
-    }
-    WiFi.scanDelete();
-    if (n == 0) {
-        netItems = "<div style='color:#8b8fa3;font-size:13px'>No networks found. Type name manually.</div>";
-    }
-
-    portalHtml = buildSetupPage(netItems);
-
-    // Start soft AP (open network for easy phone connection)
-    WiFi.softAP(AP_SSID);
-    delay(500);
-    Serial.printf("AP started: %s, IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-
-    // DNS server: redirect all lookups to our IP (triggers captive portal on iOS/Android)
-    portalDns = new DNSServer();
-    portalDns->start(53, "*", WiFi.softAPIP());
-
-    // Web server
-    portalServer = new WebServer(80);
-    portalServer->on("/", HTTP_GET, handlePortalRoot);
-    portalServer->on("/save", HTTP_POST, handlePortalSave);
-    portalServer->onNotFound(handlePortalRoot);
-    portalServer->begin();
-
-    showSetupScreen();
-}
-
-// ── WiFi Connection ─────────────────────────────────────
-static bool connectWiFi() {
-    Serial.printf("WiFi: connecting to %s...\n", cfgSsid.c_str());
-
-    M5.Display.fillScreen(BLACK);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(YELLOW, BLACK);
-    M5.Display.setCursor(5, 5);
-    M5.Display.print("Connecting WiFi...");
-    M5.Display.setTextColor(CYAN, BLACK);
-    M5.Display.setCursor(5, 22);
-    M5.Display.printf("SSID: %s", cfgSsid.c_str());
-    M5.Display.setCursor(5, 39);
-    M5.Display.printf("PASS: %s", cfgPassword.c_str());
-
-    WiFi.mode(WIFI_STA);
-    delay(500);
-
-    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-
-    wifi_config_t wifi_cfg = {};
-    strncpy((char*)wifi_cfg.sta.ssid, cfgSsid.c_str(), sizeof(wifi_cfg.sta.ssid));
-    strncpy((char*)wifi_cfg.sta.password, cfgPassword.c_str(), sizeof(wifi_cfg.sta.password));
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    wifi_cfg.sta.pmf_cfg.capable = true;
-    wifi_cfg.sta.pmf_cfg.required = false;
-
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-    esp_wifi_connect();
-
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 40) {
-        delay(500);
-        Serial.print(".");
-        tries++;
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("WiFi: connected, IP: %s\n", WiFi.localIP().toString().c_str());
-        deviceMac = WiFi.macAddress();
-        deviceMac.replace(":", "");
-        Serial.printf("Device MAC: %s\n", deviceMac.c_str());
-
-        M5.Display.setTextColor(GREEN, BLACK);
-        M5.Display.setCursor(5, 60);
-        M5.Display.printf("OK! IP: %s", WiFi.localIP().toString().c_str());
-        delay(2000);
-        return true;
-    }
-    Serial.println("WiFi: connection failed");
-
-    M5.Display.setTextColor(RED, BLACK);
-    M5.Display.setCursor(5, 60);
-    M5.Display.print("FAILED to connect!");
-    delay(2000);
-    return false;
-}
-
-// ── WebSocket Connection ────────────────────────────────
-static bool connectWebSocket() {
-    String url = cfgServerUrl + "?token=" + deviceToken + "&mac=" + deviceMac + "&fw=" + FW_VERSION;
-    Serial.printf("WS: connecting to %s\n", url.c_str());
-    return wsClient.connect(url);
-}
-
-// ── Parse host and port from server URL ─────────────────
-static void parseServerUrl(String& outHost, int& outPort) {
-    String url = cfgServerUrl;
-    int hostStart = url.indexOf("://") + 3;
-    int portStart = url.indexOf(":", hostStart);
-    int pathStart = url.indexOf("/", hostStart);
-    outHost = url.substring(hostStart, portStart > 0 ? portStart : pathStart);
-    outPort = 8888;
-    if (portStart > 0 && pathStart > portStart) {
-        outPort = url.substring(portStart + 1, pathStart).toInt();
-    }
-}
-
-// ── HTTP Helper for Pairing ─────────────────────────────
-static bool registerForPairing() {
-    WiFiClient http;
-    String serverHost;
-    int serverPort;
-    parseServerUrl(serverHost, serverPort);
-
-    if (!http.connect(serverHost.c_str(), serverPort)) {
-        Serial.println("HTTP: connection failed");
-        return false;
-    }
-
-    String body = "{\"mac\":\"" + deviceMac + "\",\"code\":\"" + pairingCode + "\"}";
-    http.printf("POST /api/devices/register HTTP/1.1\r\n"
-                "Host: %s:%d\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: close\r\n\r\n%s",
-                serverHost.c_str(), serverPort, body.length(), body.c_str());
-
-    unsigned long start = millis();
-    while (!http.available() && millis() - start < 5000) delay(10);
-
-    String response = "";
-    while (http.available()) response += (char)http.read();
-    http.stop();
-
-    Serial.printf("Register response: %s\n", response.c_str());
-    return response.indexOf("200") >= 0 || response.indexOf("201") >= 0;
-}
-
-static String pollPairingStatus() {
-    WiFiClient http;
-    String serverHost;
-    int serverPort;
-    parseServerUrl(serverHost, serverPort);
-
-    if (!http.connect(serverHost.c_str(), serverPort)) return "";
-
-    String path = "/api/devices/status?mac=" + deviceMac;
-    http.printf("GET %s HTTP/1.1\r\n"
-                "Host: %s:%d\r\n"
-                "Connection: close\r\n\r\n",
-                path.c_str(), serverHost.c_str(), serverPort);
-
-    unsigned long start = millis();
-    while (!http.available() && millis() - start < 5000) delay(10);
-
-    String response = "";
-    while (http.available()) response += (char)http.read();
-    http.stop();
-
-    int tokenStart = response.indexOf("\"token\":\"") + 9;
-    int tokenEnd = response.indexOf("\"", tokenStart);
-    if (tokenStart > 8 && tokenEnd > tokenStart) {
-        return response.substring(tokenStart, tokenEnd);
-    }
-    return "";
-}
-
-// ── OTA Display Helper ──────────────────────────────────
-static void showOtaProgress(int percent, const char* version) {
+static void showWaiting() {
     M5.Display.fillScreen(BLACK);
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(CYAN, BLACK);
-    M5.Display.setCursor(20, 10);
-    M5.Display.printf("OTA %s", version);
+    int16_t x = (M5.Display.width() - M5.Display.textWidth("BT WAITING")) / 2;
+    M5.Display.setCursor(x, 15);
+    M5.Display.print("BT WAITING");
 
-    int totalW = M5.Display.width() - 20;
-    int barW = totalW * percent / 100;
-    M5.Display.fillRect(10, 45, barW, 16, CYAN);
-    M5.Display.fillRect(10 + barW, 45, totalW - barW, 16, DARKGREY);
-    M5.Display.setTextColor(WHITE, BLACK);
-    M5.Display.setCursor(55, 70);
-    M5.Display.printf("%d%%", percent);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(DARKGREY, BLACK);
+    const char* hint = "Pair phone to \"M5Audio\"";
+    int16_t x2 = (M5.Display.width() - M5.Display.textWidth(hint)) / 2;
+    M5.Display.setCursor(x2, 55);
+    M5.Display.print(hint);
+
+    drawBattery();
 }
 
-// ── OTA Check ───────────────────────────────────────────
-static bool checkForOtaUpdate() {
-    WiFiClient http;
-    String serverHost;
-    int serverPort;
-    parseServerUrl(serverHost, serverPort);
+static void showConnected() {
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(GREEN, BLACK);
 
-    if (!http.connect(serverHost.c_str(), serverPort)) {
-        Serial.println("OTA check: connection failed");
-        return false;
+    const char* label = hfpConnected ? "A2DP+HFP" : "CONNECTED";
+    int16_t x = (M5.Display.width() - M5.Display.textWidth(label)) / 2;
+    M5.Display.setCursor(x, 10);
+    M5.Display.print(label);
+
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(YELLOW, BLACK);
+    const char* hint = hfpConnected
+        ? "Play music or make a call"
+        : "Play audio to start capture";
+    int16_t x2 = (M5.Display.width() - M5.Display.textWidth(hint)) / 2;
+    M5.Display.setCursor(x2, 45);
+    M5.Display.print(hint);
+
+    if (hfpConnected) {
+        M5.Display.setTextColor(DARKGREY, BLACK);
+        const char* hfpHint = "HFP ready for calls";
+        int16_t x3 = (M5.Display.width() - M5.Display.textWidth(hfpHint)) / 2;
+        M5.Display.setCursor(x3, 58);
+        M5.Display.print(hfpHint);
     }
 
-    String path = "/api/ota/check?mac=" + deviceMac
-                + "&version=" + String(FW_VERSION)
-                + "&token=" + deviceToken;
-    http.printf("GET %s HTTP/1.1\r\n"
-                "Host: %s:%d\r\n"
-                "Connection: close\r\n\r\n",
-                path.c_str(), serverHost.c_str(), serverPort);
-
-    unsigned long start = millis();
-    while (!http.available() && millis() - start < 5000) delay(10);
-
-    String response = "";
-    while (http.available()) response += (char)http.read();
-    http.stop();
-
-    Serial.printf("OTA check response: %s\n", response.c_str());
-
-    if (response.indexOf("\"update\":true") < 0) return false;
-
-    // Extract firmware_id
-    int fidStart = response.indexOf("\"firmware_id\":") + 14;
-    int fidEnd = response.indexOf(",", fidStart);
-    if (fidEnd < 0) fidEnd = response.indexOf("}", fidStart);
-    String fidStr = response.substring(fidStart, fidEnd);
-    fidStr.trim();
-
-    // Extract version
-    int verStart = response.indexOf("\"version\":\"") + 11;
-    int verEnd = response.indexOf("\"", verStart);
-    otaVersion = response.substring(verStart, verEnd);
-
-    // Extract sha256
-    int shaStart = response.indexOf("\"sha256\":\"") + 10;
-    int shaEnd = response.indexOf("\"", shaStart);
-    otaSha256 = response.substring(shaStart, shaEnd);
-
-    // Extract size
-    int szStart = response.indexOf("\"size\":") + 7;
-    int szEnd = response.indexOf("}", szStart);
-    String szStr = response.substring(szStart, szEnd);
-    szStr.trim();
-    otaFileSize = szStr.toInt();
-
-    // Build download URL
-    otaFirmwareUrl = "/api/ota/firmware/" + fidStr + "?token=" + deviceToken + "&mac=" + deviceMac;
-
-    Serial.printf("OTA available: v%s, %d bytes, sha256=%s\n",
-        otaVersion.c_str(), otaFileSize, otaSha256.substring(0, 16).c_str());
-    return true;
+    drawBattery();
 }
 
-// ── OTA Perform Update ──────────────────────────────────
-static bool performOtaUpdate() {
-    int batt = M5.Power.getBatteryLevel();
-    if (batt > 0 && batt < 30) {
-        showCentered("LOW BAT", RED);
-        Serial.println("OTA aborted: battery too low");
-        delay(2000);
-        return false;
-    }
-    if (WiFi.RSSI() < -80) {
-        showCentered("WEAK WiFi", RED);
-        Serial.println("OTA aborted: weak WiFi signal");
-        delay(2000);
-        return false;
-    }
-    if (ESP.getFreeHeap() < 50000) {
-        showCentered("LOW MEM", RED);
-        Serial.println("OTA aborted: insufficient heap");
-        delay(2000);
-        return false;
+static void showRecording() {
+    M5.Display.fillScreen(BLACK);
+
+    unsigned long elapsed = (millis() - streamStartMs) / 1000;
+
+    M5.Display.setTextSize(2);
+    bool isCall = hfpAudioActive;
+    M5.Display.setTextColor(isCall ? MAGENTA : RED, BLACK);
+    M5.Display.setCursor(4, 4);
+    if (isCall) {
+        M5.Display.printf("CALL %lum%02lus", elapsed / 60, elapsed % 60);
+    } else {
+        M5.Display.printf("REC %lum%02lus", elapsed / 60, elapsed % 60);
     }
 
-    String serverHost;
-    int serverPort;
-    parseServerUrl(serverHost, serverPort);
-    String fullUrl = "http://" + serverHost + ":" + String(serverPort) + otaFirmwareUrl;
-    Serial.printf("OTA download: %s\n", fullUrl.c_str());
+    int dispW = M5.Display.width() - 20;
 
-    showOtaProgress(0, otaVersion.c_str());
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(CYAN, BLACK);
+    M5.Display.setCursor(10, 30);
+    M5.Display.print("BT");
+    int btBar = constrain(btPeakLevel / 100, 0, dispW - 20);
+    M5.Display.fillRect(30, 30, btBar, 8, CYAN);
+    M5.Display.fillRect(30 + btBar, 30, dispW - 20 - btBar, 8, DARKGREY);
 
-    esp_http_client_config_t config = {};
-    config.url = fullUrl.c_str();
-    config.timeout_ms = 60000;
-    config.buffer_size = 4096;
+    M5.Display.setTextColor(GREEN, BLACK);
+    M5.Display.setCursor(10, 44);
+    M5.Display.print("MC");
+    int micBar = constrain(micPeakLevel / 100, 0, dispW - 20);
+    M5.Display.fillRect(30, 44, micBar, 8, GREEN);
+    M5.Display.fillRect(30 + micBar, 44, dispW - 20 - micBar, 8, DARKGREY);
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        showCentered("OTA ERR", RED);
-        delay(2000);
-        return false;
+    M5.Display.setTextColor(DARKGREY, BLACK);
+    float btMb  = btTotalBytes  / (1024.0f * 1024.0f);
+    float micMb = micTotalBytes / (1024.0f * 1024.0f);
+    M5.Display.setCursor(10, 60);
+    M5.Display.printf("BT:%.1fMB  MIC:%.1fMB", btMb, micMb);
+
+    drawBattery();
+}
+
+// ── Serial Frame Helpers ────────────────────────────────
+static void sendFrame(uint8_t type, const uint8_t* payload, uint16_t len) {
+    uint8_t hdr[5];
+    hdr[0] = 0xAA;
+    hdr[1] = 0x55;
+    hdr[2] = type;
+    hdr[3] = (uint8_t)(len & 0xFF);
+    hdr[4] = (uint8_t)(len >> 8);
+    Serial.write(hdr, 5);
+    if (len > 0 && payload) {
+        Serial.write(payload, len);
+    }
+}
+
+static void sendSessionStart(uint32_t btSr, uint16_t btCh, uint16_t btBps) {
+    uint8_t pay[16];
+    uint32_t sr; uint16_t ch, bps;
+
+    sr = btSr; ch = btCh; bps = btBps;
+    memcpy(pay + 0, &sr, 4);
+    memcpy(pay + 4, &ch, 2);
+    memcpy(pay + 6, &bps, 2);
+
+    sr = MIC_SAMPLE_RATE; ch = MIC_CHANNELS; bps = MIC_BPS;
+    memcpy(pay + 8,  &sr, 4);
+    memcpy(pay + 12, &ch, 2);
+    memcpy(pay + 14, &bps, 2);
+
+    sendFrame(FRAME_SESSION_START, pay, 16);
+    Serial.flush();
+}
+
+static void sendSessionEnd() {
+    sendFrame(FRAME_SESSION_END, nullptr, 0);
+    Serial.flush();
+}
+
+// ── Drain ring buffers to Serial ────────────────────────
+static void drainRingToSerial(RingBuf& ring, uint8_t frameType, volatile uint32_t& totalCounter) {
+    while (ring.available() > 0) {
+        size_t n = ring.read(drainBuf, DRAIN_CHUNK);
+        if (n == 0) break;
+        sendFrame(frameType, drainBuf, (uint16_t)n);
+        totalCounter += n;
+    }
+}
+
+// ── Compute peak from int16 samples ─────────────────────
+static int16_t computePeak(const int16_t* samples, size_t count) {
+    int16_t peak = 0;
+    size_t step = count > 64 ? count / 32 : 1;
+    for (size_t i = 0; i < count; i += step) {
+        int16_t v = samples[i] < 0 ? -samples[i] : samples[i];
+        if (v > peak) peak = v;
+    }
+    return peak;
+}
+
+// ── Session management helpers ──────────────────────────
+static void beginSession(uint32_t btSr, uint16_t btCh) {
+    if (sessionStarted) return;
+    activeBtSampleRate = btSr;
+    activeBtChannels   = btCh;
+    audioStreaming = true;
+    sessionStarted = true;
+    streamStartMs = millis();
+    btTotalBytes = 0;
+    micTotalBytes = 0;
+    btRing.flush();
+    micRing.flush();
+    M5.Mic.begin();
+    delay(50);
+    sendSessionStart(btSr, btCh, 16);
+}
+
+static void endSession() {
+    if (!sessionStarted) return;
+    drainRingToSerial(btRing, FRAME_BT_DATA, btTotalBytes);
+    drainRingToSerial(micRing, FRAME_MIC_DATA, micTotalBytes);
+    sendSessionEnd();
+    M5.Mic.end();
+    audioStreaming = false;
+    sessionStarted = false;
+}
+
+// ── A2DP Callbacks ──────────────────────────────────────
+static void onAudioData(const uint8_t* data, uint32_t length) {
+    if (hfpAudioActive) return;  // HFP takes priority; ignore stale A2DP data
+
+    if (!audioStreaming) {
+        beginSession(A2DP_SAMPLE_RATE, A2DP_CHANNELS);
     }
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        Serial.printf("OTA HTTP open failed: %s\n", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        showCentered("OTA ERR", RED);
-        delay(2000);
-        return false;
-    }
+    btRing.write(data, length);
 
-    int content_length = esp_http_client_fetch_headers(client);
-    if (content_length <= 0) {
-        Serial.printf("OTA bad content length: %d\n", content_length);
-        esp_http_client_cleanup(client);
-        showCentered("OTA ERR", RED);
-        delay(2000);
-        return false;
-    }
+    const int16_t* samples = (const int16_t*)data;
+    btPeakLevel = computePeak(samples, length / 2);
+}
 
-    const esp_partition_t* update_partition = esp_ota_get_next_update_partition(NULL);
-    if (!update_partition) {
-        Serial.println("OTA: no update partition found");
-        esp_http_client_cleanup(client);
-        showCentered("OTA ERR", RED);
-        delay(2000);
-        return false;
-    }
-
-    esp_ota_handle_t ota_handle;
-    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
-    if (err != ESP_OK) {
-        Serial.printf("OTA begin failed: %s\n", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        showCentered("OTA ERR", RED);
-        delay(2000);
-        return false;
-    }
-
-    uint8_t buf[4096];
-    int total_read = 0;
-    int last_percent = -1;
-
-    while (true) {
-        int read_len = esp_http_client_read(client, (char*)buf, sizeof(buf));
-        if (read_len < 0) {
-            Serial.println("OTA read error");
-            esp_ota_abort(ota_handle);
-            esp_http_client_cleanup(client);
-            showCentered("OTA FAIL", RED);
-            delay(3000);
-            return false;
+static void onBtStateChanged(esp_a2d_connection_state_t state, void*) {
+    if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+        btConnected = true;
+    } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+        btConnected = false;
+        if (!hfpAudioActive) {
+            endSession();
         }
-        if (read_len == 0) break;
+        btPeakLevel = 0;
+        micPeakLevel = 0;
+    }
+}
 
-        err = esp_ota_write(ota_handle, buf, read_len);
-        if (err != ESP_OK) {
-            Serial.printf("OTA write failed: %s\n", esp_err_to_name(err));
-            esp_ota_abort(ota_handle);
-            esp_http_client_cleanup(client);
-            showCentered("OTA FAIL", RED);
-            delay(3000);
-            return false;
+// ── HFP Callbacks ───────────────────────────────────────
+static void hfpClientCb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_t* param) {
+    switch (event) {
+    case ESP_HF_CLIENT_CONNECTION_STATE_EVT: {
+        auto& cs = param->conn_stat;
+        if (cs.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
+            hfpConnected = true;
+            memcpy(hfpPeerAddr, cs.remote_bda, sizeof(esp_bd_addr_t));
+        } else if (cs.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
+            hfpConnected = false;
+            hfpCallActive = false;
+            if (hfpAudioActive) {
+                hfpAudioActive = false;
+                endSession();
+            }
         }
-
-        total_read += read_len;
-        int percent = (int)((int64_t)total_read * 100 / content_length);
-        if (percent != last_percent) {
-            showOtaProgress(percent, otaVersion.c_str());
-            last_percent = percent;
-            Serial.printf("OTA progress: %d%%\r", percent);
+        break;
+    }
+    case ESP_HF_CLIENT_AUDIO_STATE_EVT: {
+        auto& as = param->audio_stat;
+        if (as.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED) {
+            hfpSampleRate = HFP_SAMPLE_RATE_NB;
+            hfpAudioActive = true;
+            if (sessionStarted) endSession();  // end any A2DP session
+            beginSession(hfpSampleRate, HFP_CHANNELS);
+        } else if (as.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC) {
+            hfpSampleRate = HFP_SAMPLE_RATE_WB;
+            hfpAudioActive = true;
+            if (sessionStarted) endSession();
+            beginSession(hfpSampleRate, HFP_CHANNELS);
+        } else if (as.state == ESP_HF_CLIENT_AUDIO_STATE_DISCONNECTED) {
+            if (hfpAudioActive) {
+                hfpAudioActive = false;
+                endSession();
+            }
         }
+        break;
     }
-
-    esp_http_client_cleanup(client);
-
-    err = esp_ota_end(ota_handle);
-    if (err != ESP_OK) {
-        Serial.printf("OTA end failed: %s\n", esp_err_to_name(err));
-        showCentered("OTA FAIL", RED);
-        delay(3000);
-        return false;
+    case ESP_HF_CLIENT_CIND_CALL_EVT:
+        hfpCallActive = (param->call.status == ESP_HF_CALL_STATUS_CALL_IN_PROGRESS);
+        break;
+    case ESP_HF_CLIENT_VOLUME_CONTROL_EVT:
+        break;
+    default:
+        break;
     }
+}
 
-    err = esp_ota_set_boot_partition(update_partition);
-    if (err != ESP_OK) {
-        Serial.printf("OTA set boot partition failed: %s\n", esp_err_to_name(err));
-        showCentered("OTA FAIL", RED);
-        delay(3000);
-        return false;
+// HFP incoming audio: remote party's voice (PCM from Bluedroid via HCI)
+static void hfpIncomingDataCb(const uint8_t* buf, uint32_t len) {
+    if (!hfpAudioActive) return;
+    btRing.write(buf, len);
+
+    const int16_t* samples = (const int16_t*)buf;
+    btPeakLevel = computePeak(samples, len / 2);
+}
+
+// HFP outgoing audio: send mic data to the phone
+// Bluedroid calls this to pull PCM for the SCO uplink.
+// Must be non-blocking; return 0 if no data ready.
+static uint32_t hfpOutgoingDataCb(uint8_t* buf, uint32_t len) {
+    if (!hfpAudioActive) return 0;
+    size_t avail = hfpMicRing.available();
+    if (avail == 0) return 0;
+    size_t toRead = (len < avail) ? len : avail;
+    return (uint32_t)hfpMicRing.read(buf, toRead);
+}
+
+// ── Downsample 16kHz -> 8kHz (simple 2:1 decimation) ───
+static size_t downsample16to8(const int16_t* src, size_t srcCount,
+                              int16_t* dst, size_t dstCap) {
+    size_t out = 0;
+    for (size_t i = 0; i < srcCount && out < dstCap; i += 2) {
+        dst[out++] = src[i];
     }
-
-    Serial.printf("OTA success! %d bytes written. Rebooting into v%s...\n",
-        total_read, otaVersion.c_str());
-    showCentered("REBOOT", GREEN);
-    delay(1500);
-    ESP.restart();
-    return true; // unreachable
+    return out;
 }
 
 // ── Setup ───────────────────────────────────────────────
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD);
     delay(100);
 
     M5.Display.setRotation(1);
     M5.Display.setBrightness(80);
-    showCentered("INIT...", YELLOW);
-
     M5.Speaker.end();
 
-    // OTA rollback safety: validate new firmware after OTA update
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            Serial.println("OTA: New firmware booted, marking as valid");
-            esp_ota_mark_app_valid_cancel_rollback();
-        }
-    }
-    Serial.printf("Firmware: v%s, partition: %s\n", FW_VERSION, running ? running->label : "?");
+    showCentered("INIT...", YELLOW);
 
-    // Factory reset: hold BtnA during boot for 5 seconds
-    M5.update();
-    if (M5.BtnA.isPressed()) {
-        unsigned long holdStart = millis();
-        while (true) {
-            M5.update();
-            if (!M5.BtnA.isPressed()) {
-                showCentered("INIT...", YELLOW);
-                break;
-            }
-            unsigned long held = (millis() - holdStart) / 1000;
-            if (held >= 5) {
-                prefs.begin("audio", false);
-                prefs.clear();
-                prefs.end();
-                showCentered("RESET!", RED);
-                delay(1500);
-                ESP.restart();
-            }
-            M5.Display.fillScreen(BLACK);
-            M5.Display.setTextSize(2);
-            M5.Display.setTextColor(YELLOW, BLACK);
-            M5.Display.setCursor(15, 15);
-            M5.Display.print("FACTORY RESET");
-            M5.Display.setCursor(15, 50);
-            M5.Display.printf("Hold %lus more...", 5 - held);
-            delay(100);
-        }
+    btRing.init(BT_RING_SIZE);
+    micRing.init(MIC_RING_SIZE);
+    hfpMicRing.init(HFP_MIC_RING_SIZE);
+
+    if (!btRing.buf || !micRing.buf || !hfpMicRing.buf) {
+        showCentered("PSRAM!", RED);
+        while (true) delay(1000);
     }
 
     auto mic_cfg          = M5.Mic.config();
-    mic_cfg.sample_rate   = SAMPLE_RATE;
+    mic_cfg.sample_rate   = MIC_SAMPLE_RATE;
     mic_cfg.dma_buf_count = 8;
     mic_cfg.dma_buf_len   = 256;
     M5.Mic.config(mic_cfg);
 
-    wsClient.onMessage(onWsMessage);
-    wsClient.onEvent(onWsEvent);
+    // Start A2DP sink
+    a2dpSink.set_stream_reader(onAudioData, false);
+    a2dpSink.set_on_connection_state_changed(onBtStateChanged);
+    a2dpSink.set_auto_reconnect(true);
+    a2dpSink.start(BT_DEVICE_NAME);
 
-    // Load saved configuration
-    prefs.begin("audio", true);
-    cfgSsid      = prefs.getString("ssid", "");
-    cfgPassword   = prefs.getString("pass", "");
-    cfgServerUrl  = prefs.getString("server", DEFAULT_SERVER);
-    deviceToken   = prefs.getString("token", "");
-    hasCanvasArt  = prefs.getBool("hasCanvas", false);
-    if (hasCanvasArt) {
-        size_t read = prefs.getBytes("canvas", canvasPixels, (size_t)CANVAS_BYTES);
-        if (read != (size_t)CANVAS_BYTES) hasCanvasArt = false;
-    }
-    prefs.end();
-    if (hasCanvasArt) Serial.println("Canvas art loaded from storage");
+    // Init HFP client on the same Bluedroid stack
+    ESP_LOGI(TAG, "Registering HFP client callback...");
+    esp_err_t err = esp_hf_client_register_callback(hfpClientCb);
+    ESP_LOGI(TAG, "esp_hf_client_register_callback: %s", esp_err_to_name(err));
 
-    Serial.printf("Config: ssid='%s', server='%s', token=%s\n",
-        cfgSsid.c_str(), cfgServerUrl.c_str(),
-        deviceToken.length() > 0 ? "present" : "none");
-    Serial.printf("Free heap: %u bytes\n", (unsigned)ESP.getFreeHeap());
+    ESP_LOGI(TAG, "Initializing HFP client...");
+    err = esp_hf_client_init();
+    ESP_LOGI(TAG, "esp_hf_client_init: %s", esp_err_to_name(err));
 
-    if (cfgSsid.length() == 0) {
-        appState = STATE_SETUP;
-        startCaptivePortal();
-    } else {
-        appState = STATE_WIFI_CONNECTING;
-    }
+    err = esp_hf_client_register_data_callback(hfpIncomingDataCb, hfpOutgoingDataCb);
+    ESP_LOGI(TAG, "esp_hf_client_register_data_callback: %s", esp_err_to_name(err));
+
+    showWaiting();
+    ESP_LOGI(TAG, "Setup complete, entering loop");
 }
 
 // ── Main Loop ───────────────────────────────────────────
 void loop() {
     M5.update();
 
-    switch (appState) {
-
-    case STATE_SETUP: {
-        portalDns->processNextRequest();
-        portalServer->handleClient();
-        break;
-    }
-
-    case STATE_WIFI_CONNECTING: {
-        // Long-press BtnA to immediately enter WiFi setup (keeps pairing token)
-        {
-            M5.update();
-            if (M5.BtnA.isPressed()) {
-                unsigned long holdStart = millis();
-                while (true) {
-                    M5.update();
-                    if (!M5.BtnA.isPressed()) break;
-                    unsigned long held = (millis() - holdStart) / 1000;
-                    if (held >= 2) {
-                        prefs.begin("audio", false);
-                        prefs.remove("ssid");
-                        prefs.remove("pass");
-                        prefs.end();
-                        showCentered("WiFi RST", RED);
-                        delay(1000);
-                        ESP.restart();
-                    }
-                    M5.Display.fillScreen(BLACK);
-                    M5.Display.setTextSize(2);
-                    M5.Display.setTextColor(YELLOW, BLACK);
-                    M5.Display.setCursor(15, 15);
-                    M5.Display.print("RESET WiFi?");
-                    M5.Display.setCursor(15, 50);
-                    M5.Display.printf("Hold %lus more...", 2 - held);
-                    delay(100);
-                }
-            }
-        }
-
-        if (connectWiFi()) {
-            wifiRetryCount = 0;
-            appState = STATE_OTA_CHECK;
-        } else {
-            wifiRetryCount++;
-            if (wifiRetryCount >= MAX_WIFI_RETRIES) {
-                Serial.println("WiFi failed too many times, entering setup portal...");
-                wifiRetryCount = 0;
-                appState = STATE_SETUP;
-                startCaptivePortal();
-            } else {
-                M5.Display.fillScreen(BLACK);
-                M5.Display.setTextSize(2);
-                M5.Display.setTextColor(RED, BLACK);
-                M5.Display.setCursor(15, 10);
-                M5.Display.print("NO WiFi");
-                M5.Display.setTextSize(1);
-                M5.Display.setTextColor(YELLOW, BLACK);
-                M5.Display.setCursor(15, 40);
-                M5.Display.printf("Retry %d/%d in 5s", wifiRetryCount, MAX_WIFI_RETRIES);
-                M5.Display.setTextColor(DARKGREY, BLACK);
-                M5.Display.setCursor(15, 60);
-                M5.Display.print("Hold btn -> WiFi setup");
-                delay(5000);
-            }
-        }
-        break;
-    }
-
-    case STATE_OTA_CHECK: {
-        if (deviceToken.length() == 0) {
-            // Not paired yet, skip OTA check
-            appState = STATE_CHECK_PAIRED;
-            break;
-        }
-        showCentered("CHECK..", YELLOW, 2);
-        Serial.println("Checking for OTA update...");
-        if (checkForOtaUpdate()) {
-            Serial.printf("OTA update available: v%s\n", otaVersion.c_str());
-            appState = STATE_OTA_UPDATING;
-        } else {
-            Serial.println("No OTA update available");
-            lastOtaCheck = millis();
-            appState = STATE_CHECK_PAIRED;
-        }
-        break;
-    }
-
-    case STATE_OTA_UPDATING: {
-        if (!performOtaUpdate()) {
-            // OTA failed, continue normal boot
-            appState = STATE_CHECK_PAIRED;
-        }
-        break;
-    }
-
-    case STATE_CHECK_PAIRED: {
-        if (deviceToken.length() > 0) {
-            Serial.println("Token exists, connecting to cloud...");
-            appState = STATE_WS_CONNECTING;
-        } else {
-            Serial.println("No token, entering pairing mode...");
-            pairingCode = generatePairingCode();
-            Serial.printf("Pairing code: %s\n", pairingCode.c_str());
-            showTwoLines("PAIR CODE:", pairingCode.c_str(), CYAN);
-            drawBattery();
-
-            if (registerForPairing()) {
-                Serial.println("Registered with cloud, waiting for user to pair...");
-            } else {
-                Serial.println("Failed to register, will retry...");
-            }
-            lastPairingPoll = millis();
-            appState = STATE_PAIRING;
-        }
-        break;
-    }
-
-    case STATE_PAIRING: {
-        if (millis() - lastPairingPoll >= PAIRING_POLL_INTERVAL) {
-            lastPairingPoll = millis();
-            String token = pollPairingStatus();
-            if (token.length() > 0) {
-                deviceToken = token;
-                prefs.begin("audio", false);
-                prefs.putString("token", deviceToken);
-                prefs.end();
-                Serial.printf("Paired! Token: %s...\n", deviceToken.substring(0, 8).c_str());
-                showCentered("PAIRED!", GREEN);
-                delay(1500);
-                appState = STATE_WS_CONNECTING;
-            }
-        }
-        break;
-    }
-
-    case STATE_WS_CONNECTING: {
-        if (WiFi.status() != WL_CONNECTED) {
-            appState = STATE_WIFI_CONNECTING;
-            break;
-        }
-
-        if (millis() - lastWsReconnect < WS_RECONNECT_INTERVAL) break;
-        lastWsReconnect = millis();
-
-        showCentered("CLOUD..", YELLOW);
-        if (connectWebSocket()) {
-            appState = STATE_READY;
-            showCentered("READY", ORANGE);
-            drawBattery();
-            screenWake();
-            Serial.printf("Connected to cloud. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
-        } else {
-            Serial.println("WS: connection failed, retrying...");
-        }
-        break;
-    }
-
-    case STATE_READY: {
-        wsClient.poll();
-
-        if (!wsConnected) {
-            appState = STATE_WS_CONNECTING;
-            break;
-        }
-
-        // Periodic OTA check (every hour)
-        if (millis() - lastOtaCheck >= OTA_CHECK_INTERVAL) {
-            lastOtaCheck = millis();
-            Serial.println("Periodic OTA check...");
-            if (checkForOtaUpdate()) {
-                showTwoLines("UPDATE", otaVersion.c_str(), CYAN);
-                drawBattery();
-                screenWake();
-                Serial.printf("OTA available: v%s -- press BtnA to update\n", otaVersion.c_str());
-                unsigned long waitStart = millis();
-                bool accepted = false;
-                while (millis() - waitStart < 10000) {
-                    M5.update();
-                    if (M5.BtnA.wasPressed()) {
-                        accepted = true;
-                        break;
-                    }
-                    delay(50);
-                }
-                if (accepted) {
-                    appState = STATE_OTA_UPDATING;
-                    break;
-                }
-                showCentered("READY", ORANGE);
-                drawBattery();
-            }
-        }
-
-        if (screenOn && millis() - screenOnMs >= SCREEN_TIMEOUT) {
-            screenSleep();
-        }
-
-        if (M5.BtnA.wasPressed()) {
-            if (!screenOn) {
-                screenWake();
-                if (showingCanvas && hasCanvasArt) {
-                    renderCanvasToDisplay();
-                } else {
-                    showCentered("READY", ORANGE);
-                    drawBattery();
-                }
-            } else {
-                showingCanvas = false;
-                Serial.println("Starting stream...");
-
-                adpcmState.predictor = 0;
-                adpcmState.index = 0;
-                dcOffset = 0;
-
-                M5.Mic.begin();
-                delay(80);
-
-                uint8_t hdr[8];
-                uint32_t sr = SAMPLE_RATE;
-                uint32_t marker = 1;
-                memcpy(hdr, &sr, 4);
-                memcpy(hdr + 4, &marker, 4);
-                wsClient.sendBinary((const char*)hdr, sizeof(hdr));
-
-                streamStartMs = millis();
-                lastWsPing = millis();
-                appState = STATE_STREAMING;
-                showStreaming(0, nullptr, 0);
-                drawBattery();
-                screenWake();
-                Serial.printf("Stream started. Free heap: %u\n", (unsigned)ESP.getFreeHeap());
-            }
-        }
-
-        if (M5.BtnB.wasPressed()) {
-            screenWake();
-            if (showingCanvas) {
-                showingCanvas = false;
-                showCentered("READY", ORANGE);
-                drawBattery();
-            } else if (hasCanvasArt) {
-                showingCanvas = true;
-                M5.Display.fillScreen(BLACK);
-                renderCanvasToDisplay();
-            }
-        }
-        break;
-    }
-
-    case STATE_STREAMING: {
-        wsClient.poll();
-
-        if (wsConnected && millis() - lastWsPing >= WS_PING_INTERVAL) {
-            wsClient.ping();
-            lastWsPing = millis();
-        }
-
-        if (!wsConnected) {
-            M5.Mic.end();
-            unsigned long elapsed = (millis() - streamStartMs) / 1000;
-            Serial.printf("Stream lost after %lus (RSSI=%d, heap=%u)\n",
-                elapsed, WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
-            appState = STATE_WS_CONNECTING;
-            screenWake();
-            showCentered("LOST", RED);
-            delay(1000);
-            break;
-        }
-
-        if (M5.BtnA.wasPressed()) {
-            M5.Mic.end();
-            delay(100);
-
-            uint8_t eot[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
-            wsClient.sendBinary((const char*)eot, sizeof(eot));
-
-            unsigned long elapsed = (millis() - streamStartMs) / 1000;
-            Serial.printf("Stream stopped after %lus\n", elapsed);
-
-            appState = STATE_READY;
-            screenWake();
-            showCentered("READY", ORANGE);
-            drawBattery();
-            break;
-        }
-
-        if (M5.Mic.record(pcmChunk, MIC_CHUNK, SAMPLE_RATE)) {
-            removeDcInPlace(pcmChunk, MIC_CHUNK);
-            adpcm_encode_block(pcmChunk, adpcmBuf, MIC_CHUNK);
-
-            if (wsConnected) {
-                wsClient.sendBinary((const char*)adpcmBuf, MIC_CHUNK / 2);
-            }
-        }
-
-        if (screenOn && millis() - screenOnMs >= SCREEN_TIMEOUT) {
-            screenSleep();
-        }
-
+    // BtnA: toggle screen on/off
+    if (M5.BtnA.wasPressed()) {
+        screenOn = !screenOn;
         if (screenOn) {
-            static int lastDispSec = -1;
-            int sec = (millis() - streamStartMs) / 1000;
-            if (sec != lastDispSec) {
-                showStreaming(sec, pcmChunk, MIC_CHUNK);
-                drawBattery();
-                lastDispSec = sec;
+            M5.Display.setBrightness(80);
+            lastDisplayUpdate = 0;
+        } else {
+            M5.Display.setBrightness(0);
+        }
+    }
+
+    if (audioStreaming && sessionStarted) {
+        // Record mic chunk
+        if (M5.Mic.record(micPcmBuf, MIC_CHUNK, MIC_SAMPLE_RATE)) {
+            // Always write to serial-capture ring
+            micRing.write((const uint8_t*)micPcmBuf, MIC_CHUNK * sizeof(int16_t));
+            micPeakLevel = computePeak(micPcmBuf, MIC_CHUNK);
+
+            // If HFP call active, also feed mic to HFP outgoing ring
+            if (hfpAudioActive) {
+                if (hfpSampleRate == HFP_SAMPLE_RATE_NB) {
+                    // Downsample 16kHz -> 8kHz for CVSD
+                    int16_t downBuf[MIC_CHUNK / 2];
+                    size_t n = downsample16to8(micPcmBuf, MIC_CHUNK,
+                                               downBuf, MIC_CHUNK / 2);
+                    hfpMicRing.write((const uint8_t*)downBuf, n * sizeof(int16_t));
+                } else {
+                    // 16kHz matches mic rate — pass through
+                    hfpMicRing.write((const uint8_t*)micPcmBuf,
+                                    MIC_CHUNK * sizeof(int16_t));
+                }
+                esp_hf_client_outgoing_data_ready();
             }
         }
 
-        break;
+        // Drain both ring buffers to serial with framing
+        drainRingToSerial(btRing, FRAME_BT_DATA, btTotalBytes);
+        drainRingToSerial(micRing, FRAME_MIC_DATA, micTotalBytes);
     }
+
+    // Update display periodically
+    if (screenOn && millis() - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+        lastDisplayUpdate = millis();
+
+        if (audioStreaming && sessionStarted) {
+            showRecording();
+        } else if (btConnected || hfpConnected) {
+            showConnected();
+        } else {
+            showWaiting();
+        }
     }
+
+    delay(1);  // yield to RTOS IDLE task (prevents WDT under ESP-IDF)
 }
