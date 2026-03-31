@@ -17,7 +17,7 @@ import io
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, UploadFile, File, Form, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -527,6 +527,68 @@ async def send_canvas_to_device(
         raise HTTPException(status_code=409, detail="Device connection lost")
 
     return {"status": "sent", "device_id": device_id}
+
+
+# ═══════════════════════════════════════════════════════════════
+# REST API: Offline WAV Upload (from device SD card)
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/api/upload", status_code=201)
+async def upload_wav(request: Request, db: AsyncSession = Depends(get_db)):
+    """Accept a raw WAV file upload from a device that recorded offline."""
+    token = request.headers.get("X-Device-Token", "")
+    mac = request.headers.get("X-Device-MAC", "")
+
+    if not token or not mac:
+        raise HTTPException(status_code=401, detail="Missing device credentials")
+
+    result = await db.execute(
+        select(Device).where(Device.api_token == token, Device.mac_address == mac)
+    )
+    device = result.scalar_one_or_none()
+    if not device or not device.user_id:
+        raise HTTPException(status_code=401, detail="Invalid device credentials")
+
+    body = await request.body()
+    if len(body) < 44:
+        raise HTTPException(status_code=400, detail="File too small to be a valid WAV")
+
+    try:
+        wav_file = wave.open(io.BytesIO(body), 'rb')
+        sample_rate = wav_file.getframerate()
+        pcm_audio = wav_file.readframes(wav_file.getnframes())
+        wav_file.close()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid WAV file")
+
+    session = Session(
+        device_id=device.id,
+        user_id=device.user_id,
+        status=SessionStatus.PROCESSING,
+        ended_at=datetime.utcnow(),
+    )
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+
+    sid = session.id
+    uid = device.user_id
+
+    async def process_uploaded():
+        transcript = await run_transcription(sid, uid, bytearray(pcm_audio), sample_rate)
+        if transcript:
+            await run_llm_processing(sid, uid, transcript)
+        else:
+            async with async_session() as db2:
+                s = await db2.execute(select(Session).where(Session.id == sid))
+                sess = s.scalar_one_or_none()
+                if sess:
+                    sess.status = SessionStatus.DONE
+                    await db2.commit()
+
+    asyncio.create_task(process_uploaded())
+
+    return {"status": "accepted", "session_id": session.id}
 
 
 # ═══════════════════════════════════════════════════════════════

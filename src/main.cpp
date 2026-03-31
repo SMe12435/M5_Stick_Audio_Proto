@@ -219,6 +219,7 @@ static void showCentered(const char* msg, uint16_t color, uint8_t size = 3) {
     int16_t y = (M5.Display.height() - size * 8) / 2;
     M5.Display.setCursor(x, y);
     M5.Display.print(msg);
+    Serial.printf("[SCREEN] %s\n", msg);
 }
 
 static void showTwoLines(const char* line1, const char* line2, uint16_t color) {
@@ -232,6 +233,7 @@ static void showTwoLines(const char* line1, const char* line2, uint16_t color) {
     int16_t x2 = (M5.Display.width() - M5.Display.textWidth(line2)) / 2;
     M5.Display.setCursor(x2, 48);
     M5.Display.print(line2);
+    Serial.printf("[SCREEN] %s %s\n", line1, line2);
 }
 
 static void showStreaming(int seconds, const int16_t* samples, size_t count) {
@@ -241,15 +243,17 @@ static void showStreaming(int seconds, const int16_t* samples, size_t count) {
     M5.Display.setCursor(20, 10);
     M5.Display.printf("STREAM  %ds", seconds);
 
+    int avg = 0;
     if (count > 0) {
         int32_t sum = 0;
         for (size_t i = 0; i < count; i++)
             sum += abs(samples[i]);
-        int avg = sum / count;
+        avg = sum / count;
         int barW = constrain(avg / 6, 0, M5.Display.width() - 20);
         M5.Display.fillRect(10, 55, barW, 14, GREEN);
         M5.Display.fillRect(10 + barW, 55, M5.Display.width() - 20 - barW, 14, DARKGREY);
     }
+    Serial.printf("[SCREEN] STREAM %ds | level=%d\n", seconds, avg);
 }
 
 static void showSetupScreen() {
@@ -274,6 +278,10 @@ static void showSetupScreen() {
     M5.Display.setTextColor(DARKGREY, BLACK);
     M5.Display.setCursor(10, 85);
     M5.Display.printf("Open http://%s", WiFi.softAPIP().toString().c_str());
+
+    Serial.println("[SCREEN] SETUP MODE");
+    Serial.printf("[SCREEN] Connect phone WiFi to: %s\n", AP_SSID);
+    Serial.printf("[SCREEN] Open http://%s\n", WiFi.softAPIP().toString().c_str());
 }
 
 // ── Screen Power Helpers ────────────────────────────────
@@ -288,6 +296,8 @@ static void screenSleep() {
     screenOn = false;
 }
 
+static int lastBatteryPct = -1;
+
 static void drawBattery() {
     int pct = M5.Power.getBatteryLevel();
     M5.Display.setTextSize(1);
@@ -297,6 +307,10 @@ static void drawBattery() {
     int16_t x = M5.Display.width() - M5.Display.textWidth(buf) - 4;
     M5.Display.setCursor(x, 2);
     M5.Display.print(buf);
+    if (pct != lastBatteryPct) {
+        Serial.printf("[BAT] %d%%\n", pct);
+        lastBatteryPct = pct;
+    }
 }
 
 // ── DC Offset Removal ───────────────────────────────────
@@ -349,6 +363,7 @@ static void onWsMessage(WebsocketsMessage msg) {
             M5.Display.setTextColor(YELLOW, BLACK);
             M5.Display.setCursor(5, 60);
             M5.Display.print("Rebooting...");
+            Serial.printf("[SCREEN] WiFi Updated! SSID: %s, Rebooting...\n", newSsid.c_str());
             delay(4000);
             ESP.restart();
         }
@@ -524,6 +539,7 @@ static void handlePortalSave() {
     M5.Display.setTextColor(YELLOW, BLACK);
     M5.Display.setCursor(5, 60);
     M5.Display.print("Rebooting...");
+    Serial.printf("[SCREEN] WiFi Saved! SSID: %s, Rebooting...\n", ssid.c_str());
 
     portalServer->send(200, "text/html",
         "<!DOCTYPE html><html><head>"
@@ -596,6 +612,7 @@ static bool connectWiFi() {
     M5.Display.printf("SSID: %s", cfgSsid.c_str());
     M5.Display.setCursor(5, 39);
     M5.Display.printf("PASS: %s", cfgPassword.c_str());
+    Serial.printf("[SCREEN] Connecting WiFi... SSID: %s\n", cfgSsid.c_str());
 
     WiFi.mode(WIFI_STA);
     delay(500);
@@ -629,6 +646,7 @@ static bool connectWiFi() {
         M5.Display.setTextColor(GREEN, BLACK);
         M5.Display.setCursor(5, 60);
         M5.Display.printf("OK! IP: %s", WiFi.localIP().toString().c_str());
+        Serial.printf("[SCREEN] WiFi OK! IP: %s\n", WiFi.localIP().toString().c_str());
         delay(2000);
         return true;
     }
@@ -637,6 +655,7 @@ static bool connectWiFi() {
     M5.Display.setTextColor(RED, BLACK);
     M5.Display.setCursor(5, 60);
     M5.Display.print("FAILED to connect!");
+    Serial.println("[SCREEN] WiFi FAILED to connect!");
     delay(2000);
     return false;
 }
@@ -736,6 +755,7 @@ static void showOtaProgress(int percent, const char* version) {
     M5.Display.setTextColor(WHITE, BLACK);
     M5.Display.setCursor(55, 70);
     M5.Display.printf("%d%%", percent);
+    Serial.printf("[SCREEN] OTA %s %d%%\n", version, percent);
 }
 
 // ── OTA Check ───────────────────────────────────────────
@@ -991,6 +1011,7 @@ void setup() {
             M5.Display.print("FACTORY RESET");
             M5.Display.setCursor(15, 50);
             M5.Display.printf("Hold %lus more...", 5 - held);
+            Serial.printf("[SCREEN] FACTORY RESET - Hold %lus more...\n", 5 - held);
             delay(100);
         }
     }
@@ -1069,6 +1090,7 @@ void loop() {
                     M5.Display.print("RESET WiFi?");
                     M5.Display.setCursor(15, 50);
                     M5.Display.printf("Hold %lus more...", 2 - held);
+                    Serial.printf("[SCREEN] RESET WiFi? Hold %lus more...\n", 2 - held);
                     delay(100);
                 }
             }
@@ -1097,6 +1119,7 @@ void loop() {
                 M5.Display.setTextColor(DARKGREY, BLACK);
                 M5.Display.setCursor(15, 60);
                 M5.Display.print("Hold btn -> WiFi setup");
+                Serial.printf("[SCREEN] NO WiFi | Retry %d/%d in 5s\n", wifiRetryCount, MAX_WIFI_RETRIES);
                 delay(5000);
             }
         }
