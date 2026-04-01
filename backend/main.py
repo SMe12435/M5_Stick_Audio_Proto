@@ -179,6 +179,51 @@ async def pair_device(
     return {"status": "paired", "device_name": device.name, "device_id": device.id}
 
 
+class DeviceAutoRegisterRequest(BaseModel):
+    mac: str
+    email: str
+    password: str
+    action: str = "login"
+
+
+@app.post("/api/devices/register-with-user", status_code=200)
+async def register_device_with_user(req: DeviceAutoRegisterRequest, db: AsyncSession = Depends(get_db)):
+    """Called by device during setup to pair itself with a user account in one step.
+    action='login' validates existing credentials; action='signup' creates a new account."""
+    if req.action == "signup":
+        existing = await db.execute(select(User).where(User.email == req.email))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        user = User(email=req.email, password_hash=hash_password(req.password))
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+    else:
+        result = await db.execute(select(User).where(User.email == req.email))
+        user = result.scalar_one_or_none()
+        if not user or not verify_password(req.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    result = await db.execute(select(Device).where(Device.mac_address == req.mac))
+    device = result.scalar_one_or_none()
+
+    if device and device.user_id and device.api_token:
+        return {"paired": True, "token": device.api_token}
+
+    if not device:
+        device = Device(mac_address=req.mac)
+        db.add(device)
+
+    device.user_id = user.id
+    device.api_token = secrets.token_hex(32)
+    device.pairing_code = None
+    device.pairing_code_expires_at = None
+    device.paired_at = datetime.utcnow()
+    await db.commit()
+
+    return {"paired": True, "token": device.api_token}
+
+
 @app.get("/api/devices")
 async def list_devices(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Device).where(Device.user_id == user.id))
